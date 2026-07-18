@@ -381,10 +381,41 @@ textarea.sk-input{font-family:'JetBrains Mono',monospace;resize:vertical}
 /* Toast */
 #toast{position:fixed;bottom:70px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--s3);border:1px solid var(--b3);border-radius:7px;padding:6px 14px;font-size:11px;color:var(--tx);opacity:0;transition:all .2s;pointer-events:none;z-index:999;font-family:'JetBrains Mono',monospace;white-space:nowrap;max-width:92vw;overflow:hidden;text-overflow:ellipsis}
 #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* Mobile */
+.side-toggle{display:none;width:34px;height:34px;background:transparent;border:1px solid var(--b2);border-radius:6px;color:var(--m2);cursor:pointer;align-items:center;justify-content:center;flex-shrink:0}
+.side-toggle:active{border-color:var(--b3);color:var(--tx)}
+@media(max-width:720px){
+  .side-toggle{display:flex}
+  aside{position:fixed;top:0;left:0;bottom:0;z-index:130;width:min(300px,84vw);transform:translateX(-100%);transition:transform .25s ease;box-shadow:16px 0 48px rgba(0,0,0,.55)}
+  body.side-open aside{transform:translateX(0)}
+  body.side-open::before{content:'';position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:125}
+  header{flex-wrap:wrap;row-gap:6px;padding:8px 10px}
+  .hc{order:3;flex-basis:100%;flex-wrap:nowrap;justify-content:flex-start;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px;-webkit-mask-image:linear-gradient(90deg,#000 90%,transparent);mask-image:linear-gradient(90deg,#000 90%,transparent)}
+  .hc::-webkit-scrollbar{display:none}
+  .hbtns{margin-left:auto}
+  .hbtn{height:34px;padding:0 12px;font-size:11px}
+  .kbody{padding:6px 10px 10px}
+  .kai{font-size:13px;padding:8px 10px}
+  .kab{padding:8px 12px;font-size:11px}
+  .klink{font-size:10px;padding:3px 0}
+  .stab{padding:10px 2px;font-size:10px}
+  .sk-input{font-size:13px;padding:8px 10px}
+  .welcome{padding:24px 14px;gap:12px}
+  .welcome h2{font-size:22px}
+  .wg{grid-template-columns:1fr;max-width:420px}
+  .ap{position:fixed;top:0;right:0;bottom:0;z-index:120;box-shadow:-16px 0 48px rgba(0,0,0,.55)}
+  .ap.open{width:100vw;border-left-width:0}
+  .ib,.sb{width:38px;height:38px}
+  #ui{font-size:16px}
+}
 </style>
 </head>
 <body>
 <header>
+  <button type="button" class="side-toggle" onclick="document.body.classList.toggle('side-open')" aria-label="Toggle chats and skills panel">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
   <div class="logo"><div class="lm">Ro</div><div class="lt">Ro<em>Script</em> <sup>AI Pro</sup></div></div>
   <div class="hc" id="hc"></div>
   <div class="hbtns">
