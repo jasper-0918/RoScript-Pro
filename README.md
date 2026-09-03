@@ -91,6 +91,28 @@ Because it's just static HTML/JS, you can also host it anywhere: GitHub Pages, N
 
 ---
 
+## Goal Mode
+
+The Roblox Studio plugin (`studio-plugin/RoScriptPro.lua`) — a separate, single-file companion to the browser app above, installed straight into Studio — adds a second mode next to its chat assistant: Goal Mode, switched on with the Chat|Goal toggle in the plugin's top bar.
+
+Set a goal in plain English, review the plan it comes back with and approve it (or revise the note and ask again, or cancel), and it acts on your project step by step. When the approved steps are done it can verify against how your game actually runs, then it records what happened and is ready to plan again — carrying forward what it learned instead of making you re-explain your project every time.
+
+The cycle, by name: **Idle → Planning → Awaiting approval → Acting → Verifying → Repairing (only if Verifying finds trouble) → Recording**, then back to Idle.
+
+Everything Goal Mode touches lives in one place, `ServerStorage.RoScriptPro`, kept separate from your actual game tree:
+- **Memory** — the facts it has gathered about your project, plus a running Notes summary (Game / Conventions / Decisions / Known issues) it rewrites at the end of every cycle, so the next goal starts already knowing your project.
+- **Manifest** — a hash of every script it has touched, so it can tell what's changed since it last looked.
+- **Plans** — one record per completed cycle: the goal, the steps, what changed, and enough detail to revert it later.
+- **Trash** — anything a plan moved aside or replaced, kept here instead of being deleted.
+
+**Revert** a plan from the Plans view: it restores every script the plan touched, as long as you haven't hand-edited it since (anything you've touched is skipped and listed, never overwritten), and moves anything the plan created into Trash rather than deleting it.
+
+Two safety facts worth knowing:
+- The model never destroys anything. Removals go to Trash first, and anything there can be restored — Trash keeps its newest 25 items for up to 14 days, after which the oldest are cleared automatically.
+- The plugin never starts or stops a playtest for you. Verifying watches the Run button you press yourself (F8); the model reads what happens while it runs, but pressing Run and Stop stays entirely in your hands.
+
+---
+
 ## 📦 Hosting it yourself (optional)
 
 Since it's a static file, you can deploy it for free in under a minute:

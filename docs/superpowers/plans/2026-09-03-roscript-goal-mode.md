@@ -494,14 +494,17 @@ do
 		return RunService:IsEdit()
 	end
 
-	-- FNV-1a 32-bit, hex. Luau has no hashing built in.
+	-- FNV-1a 32-bit, hex. Luau has no hashing built in, and a plain h * prime
+	-- overflows 2^53 for large h, so the multiply is done exactly in 16-bit halves.
+	local function mul32(a, b)
+		local al, ah = a % 65536, math.floor(a / 65536)
+		local bl, bh = b % 65536, math.floor(b / 65536)
+		return (al * bl + ((ah * bl + al * bh) % 65536) * 65536) % 4294967296
+	end
 	function Store.hash(s)
 		local h = 2166136261
 		for i = 1, #s do
-			h = bit32.bxor(h, s:byte(i))
-			h = bit32.band(h * 16777619, 0xFFFFFFFF)
-			-- (h * prime) can exceed 2^53 only if h > ~5e8 * ...; bit32.band on a float is fine below 2^53,
-			-- and 0xFFFFFFFF * 16777619 < 2^53, so this stays exact.
+			h = mul32(bit32.bxor(h, s:byte(i)), 16777619)
 		end
 		return string.format("%08x", h)
 	end
@@ -595,7 +598,10 @@ do
 		return text:sub(1, a - 1), text:sub(b + 1)
 	end
 	function Store.writeMemory(facts, notes)
-		local root = Store.ensure()
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
 		Store.writeText(root.Memory, utf8Trim(facts, FACTS_MAX) .. SEP .. utf8Trim(notes, NOTES_MAX))
 	end
 
@@ -608,7 +614,10 @@ do
 		return ok and type(map) == "table" and map or {}
 	end
 	function Store.writeManifest(map)
-		local root = Store.ensure()
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
 		Store.writeText(root.Manifest, HttpService:JSONEncode(map))
 	end
 
@@ -655,7 +664,10 @@ do
 
 	-- Caller holds the recording. beforeSources: k -> source text for changed[].before = "before/k".
 	function Store.writePlan(record, beforeSources)
-		local root = Store.ensure()
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
 		local p = child(root.Plans, record.id)
 		p:SetAttribute("RSP_Status", record.status)
 		p:SetAttribute("RSP_CreatedAt", record.createdAt)
@@ -689,7 +701,10 @@ do
 
 	-- Inside the step's recording (caller holds it).
 	function Store.trash(inst, planId)
-		local root = Store.ensure()
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
 		inst:SetAttribute("RSP_OrigParent", inst.Parent and inst.Parent:GetFullName() or "")
 		inst:SetAttribute("RSP_OrigName", inst.Name)
 		inst:SetAttribute("RSP_Plan", planId or "")
@@ -821,6 +836,8 @@ SelfTest.case("tools: value codec", function()
 	assert(Tools.decodeValue("true", "boolean") == true, "decode bool")
 	local _, err = Tools.decodeValue('"Nope"', "Material")
 	assert(err, "bad enum rejected")
+	local _, e2 = Tools.decodeValue("5", "UDim2")
+	assert(e2 and e2:find("expected", 1, true), "non-table for UDim2 rejected, not thrown")
 end)
 SelfTest.case("tools: index caps and labels", function()
 	withScratch(function(f)
@@ -918,13 +935,16 @@ do
 			if type(v) ~= "table" then return nil, "expected {x,y,z}" end
 			return Vector3.new(tonumber(v.x) or 0, tonumber(v.y) or 0, tonumber(v.z) or 0)
 		elseif expected == "Vector2" then
+			if type(v) ~= "table" then return nil, "expected {x,y}" end
 			return Vector2.new(tonumber(v.x) or 0, tonumber(v.y) or 0)
 		elseif expected == "Color3" then
 			if type(v) ~= "table" then return nil, "expected {r,g,b} 0-255" end
 			return Color3.fromRGB(math.clamp(tonumber(v.r) or 0, 0, 255), math.clamp(tonumber(v.g) or 0, 0, 255), math.clamp(tonumber(v.b) or 0, 0, 255))
 		elseif expected == "UDim" then
+			if type(v) ~= "table" then return nil, "expected {s,o}" end
 			return UDim.new(tonumber(v.s) or 0, tonumber(v.o) or 0)
 		elseif expected == "UDim2" then
+			if type(v) ~= "table" then return nil, "expected {xs,xo,ys,yo}" end
 			return UDim2.new(tonumber(v.xs) or 0, tonumber(v.xo) or 0, tonumber(v.ys) or 0, tonumber(v.yo) or 0)
 		elseif expected == "Instance" then
 			local inst = type(v) == "string" and Tools.resolve(v)
@@ -1155,6 +1175,7 @@ git commit -m "goal-mode: TOOLS read set (refs, source reads, whitelist codec, i
 The classifier is pure given synthetic inputs:
 ```lua
 SelfTest.case("provider: 413 classifies as too-large before rate-limit", function()
+	Cooling["groq:1"] = nil
 	local state = { failedModels = {}, failedProviders = {} }
 	local entry = { p = "groq", m = "openai/gpt-oss-120b", key = "k", idx = 1 }
 	local reason, action = classifyFailure(entry, 413, '{"error":{"message":"Request too large for model ... on tokens per minute (TPM): Limit 8000, Requested 12000","code":"rate_limit_exceeded"}}', {}, nil, state)
@@ -1272,9 +1293,9 @@ After decoding, replace the `choice.message` handling:
 		return nil, resp.StatusCode, "empty content", resp.Headers, nil
 	end
 	return {
-		text = type(text) == "string" and text or nil,
+		text = (type(text) == "string" and text ~= "") and text or nil,
 		toolCalls = (type(calls) == "table" and #calls > 0) and calls or nil,
-		reasoning = type(msg.reasoning) == "string" and msg.reasoning or nil,
+		reasoning = (type(msg.reasoning) == "string" and msg.reasoning ~= "") and msg.reasoning or nil,
 		usage = decoded.usage,
 		truncated = (choice.finish_reason == "length"),
 		entry = entry,
@@ -1461,10 +1482,10 @@ local function estimateTokens(messages, tools, lastUsage)
 end
 
 -- Replace the oldest tool results until under BIG_REQ_MAX. Returns true if anything changed.
-local function compactConvo(convo)
+local function compactConvo(convo, tools)
 	local changed = false
 	local ELIDED = "[result elided; call the tool again if needed]"
-	while estimateTokens(convo.messages, convo.tools, nil) > BIG_REQ_MAX do
+	while estimateTokens(convo.messages, tools, nil) > BIG_REQ_MAX do
 		local victim
 		for _, m in ipairs(convo.messages) do
 			if m.role == "tool" and m.content ~= ELIDED then victim = m; break end
@@ -1484,12 +1505,20 @@ local lastCerebrasAt = {} -- key idx -> os.clock()
 
 -- One model turn with all the free-tier survival rules (§6.4, §6.7).
 local function requestWithWaits(convo, ps, tools)
+	-- Every status write is generation-checked: chatOnce can call this several
+	-- times per request while walking the queue, and a Stop mid-flight must not
+	-- leave a stale phase on the label.
+	local function say(text)
+		if Agent.checkGen(ps.myGen) then
+			GoalUI.setPhase(ps.phase, text)
+		end
+	end
 	local waits = 0
 	while true do
 		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		local est = estimateTokens(convo.messages, tools, convo.lastUsage)
 		if est > BIG_REQ_MAX then
-			compactConvo(convo)
+			compactConvo(convo, tools)
 			est = estimateTokens(convo.messages, tools, nil)
 			if est > BIG_REQ_MAX then return nil, "context too large for the free tiers" end
 		end
@@ -1501,14 +1530,14 @@ local function requestWithWaits(convo, ps, tools)
 		for idx, at in pairs(lastCerebrasAt) do
 			local gap = CEREBRAS_MIN_GAP - (os.clock() - at)
 			if gap > 0 and gap < CEREBRAS_MIN_GAP then
-				GoalUI.setPhase(ps.phase, ("pacing Cerebras key #%d, %ds"):format(idx, math.ceil(gap)))
+				say(("pacing Cerebras key #%d, %ds"):format(idx, math.ceil(gap)))
 				task.wait(gap)
 				if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 			end
 		end
 		local state = { failedModels = {}, failedProviders = {} }
 		local opts = { goal = true, tools = tools, temperature = GOAL_TEMPERATURE, estTokens = est, maxTokens = nil }
-		local result, err = chatOnce(convo.messages, state, function(text) GoalUI.setPhase(ps.phase, text) end, opts)
+		local result, err = chatOnce(convo.messages, state, say, opts)
 		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		if result then
 			ps.used.tokens += (result.usage and result.usage.total_tokens) or est
@@ -1522,7 +1551,7 @@ local function requestWithWaits(convo, ps, tools)
 		-- too large somewhere: compact once and retry the remaining queue
 		if state.lastCode == 413 and not convo.compactedOnce then
 			convo.compactedOnce = true
-			if compactConvo(convo) then continue end
+			if compactConvo(convo, tools) then continue end
 		end
 		-- cooldown wait: only when something is merely cooling
 		local soonest
@@ -1535,7 +1564,7 @@ local function requestWithWaits(convo, ps, tools)
 		end
 		if soonest and soonest <= GOAL_WAIT_MAX and waits < GOAL_WAITS_PER_REQUEST then
 			waits += 1
-			GoalUI.setPhase(ps.phase, ("waiting %ds for a key to cool"):format(math.ceil(soonest)))
+			say(("waiting %ds for a key to cool"):format(math.ceil(soonest)))
 			task.wait(soonest + 1)
 			continue
 		end
@@ -1571,7 +1600,7 @@ local function runToolBatch(calls, ps)
 		return results, nil
 	end
 	local writes, control = {}, nil
-	local anyAttributableError, anyOk = false, false
+	local anyOk, anyFail, allAttributable = false, false, true
 	local pending = {} -- index -> result table (writes are filled by the executor)
 	for i, c in ipairs(calls) do
 		local name = c["function"].name
@@ -1584,7 +1613,11 @@ local function runToolBatch(calls, ps)
 		elseif not args then
 			pending[i] = { ok = false, error = aerr }
 		elseif CONTROL[name] then
-			control = { name = name, args = args, index = i }
+			if control then
+				pending[i] = { ok = false, error = "only one control call per turn; " .. name .. " ignored", attributable = false }
+			else
+				control = { name = name, args = args, index = i }
+			end
 		elseif WRITE_TOOLS[name] then
 			table.insert(writes, { index = i, name = name, args = args })
 		else
@@ -1610,10 +1643,17 @@ local function runToolBatch(calls, ps)
 	end
 	for i, c in ipairs(calls) do
 		local r = pending[i] or { ok = false, error = "no result" }
-		if r.ok then anyOk = true elseif r.attributable ~= false then anyAttributableError = true end
+		if r.ok then
+			anyOk = true
+		elseif not CONTROL[c["function"].name] then
+			anyFail = true
+			if r.attributable == false then
+				allAttributable = false
+			end
+		end
 		results[i] = { id = c.id, content = HttpService:JSONEncode(r) }
 	end
-	if anyAttributableError and not anyOk then ps.consecutiveErrors += 1 else ps.consecutiveErrors = 0 end
+	if anyFail and not anyOk and allAttributable then ps.consecutiveErrors += 1 else ps.consecutiveErrors = 0 end
 	return results, control
 end
 ```
@@ -1672,6 +1712,11 @@ Reload with `DEV = true`. Expected: two FAIL lines.
 - [ ] **Step 2: The prompts and the variable block**
 
 ```lua
+-- Shared default so every `S.get("goal_focus", ...)` call site (below and in
+-- Step 4) agrees on what "no setting yet" means; declared before
+-- buildGoalUserBlock, its earliest use site in source order.
+local DEFAULT_FOCUS = { bugs = true, quality = true }
+
 local SYS_GOAL = [==[You are RoScript Pro Goal Mode, an engineering agent working INSIDE Roblox Studio through tools. You never see the screen; you read the place through index/inspect/read_script/search/read_output and change it only through the write tools.
 
 Rules:
@@ -1718,7 +1763,7 @@ local function buildGoalUserBlock(phaseInstruction)
 		local n = select(2, Tools.readSource(active):gsub("\n", "")) + 1
 		table.insert(parts, ("=== ACTIVE SCRIPT ===\n%s (%s, %d lines) %s"):format(active:GetFullName(), active.ClassName, n, Tools.ref(active)))
 	end
-	if S.get("goal_focus", { bugs = true, quality = true }).bugs then
+	if S.get("goal_focus", DEFAULT_FOCUS).bugs then
 		local o = Tools.read.read_output({ count = 40 })
 		if o.ok and #o.lines > 0 then table.insert(parts, "=== RECENT OUTPUT ERRORS ===\n" .. table.concat(o.lines, "\n")) end
 	end
@@ -1751,7 +1796,7 @@ end
 
 local FOCUS_LABELS = { bugs = "Bugs and errors", quality = "Code quality", perf = "Performance", ideas = "Gameplay ideas", polish = "Polish" }
 local function focusText()
-	local f = S.get("goal_focus", { bugs = true, quality = true })
+	local f = S.get("goal_focus", DEFAULT_FOCUS)
 	local out = {}
 	for _, id in ipairs({ "bugs", "quality", "perf", "ideas", "polish" }) do
 		if f[id] then table.insert(out, FOCUS_LABELS[id]) end
@@ -1945,13 +1990,13 @@ local function buildGoalView(root)
 	mk("UICorner", { CornerRadius = UDim.new(0, 4) }, goalBox)
 	local chips = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -16, 0, 22), Position = UDim2.new(0, 8, 0, 74) }, goalView)
 	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, chips)
-	local focus = S.get("goal_focus", { bugs = true, quality = true })
+	local focus = S.get("goal_focus", DEFAULT_FOCUS)
 	for _, id in ipairs(FOCUS_IDS) do
 		local on = focus[id] == true
 		local b = mk("TextButton", { BackgroundColor3 = on and C.ACCENT or C.PANEL2, Size = UDim2.new(0, 66, 1, 0), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = C.TEXT, Text = FOCUS_LABELS[id], AutoButtonColor = false }, chips)
 		mk("UICorner", { CornerRadius = UDim.new(0, 4) }, b)
 		b.MouseButton1Click:Connect(function()
-			local f = S.get("goal_focus", { bugs = true, quality = true })
+			local f = table.clone(S.get("goal_focus", DEFAULT_FOCUS))
 			f[id] = not f[id] or nil
 			S.set("goal_focus", f)
 			b.BackgroundColor3 = f[id] and C.ACCENT or C.PANEL2
@@ -1995,7 +2040,7 @@ end
 -- Blocking prompt: returns "allow" | "skip" | "stop". Runs in the calling coroutine (a batch, before its recording opens).
 GoalUI.prompt = function(kind, payload)
 	local answer = nil
-	local panel = openModalPanel(payload.title or kind)
+	local _, panel = openModalPanel(payload.title or kind)
 	local body = mk("ScrollingFrame", { BackgroundColor3 = C.CODEBG, Size = UDim2.new(1, -16, 1, -80), Position = UDim2.new(0, 8, 0, 34), AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarThickness = 6 }, panel)
 	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, body)
 	for i, chunk in ipairs(chunkText(payload.text or "")) do
@@ -2010,7 +2055,7 @@ GoalUI.prompt = function(kind, payload)
 	return answer or "stop"
 end
 ```
-`openModalPanel` in v1 returns the panel; confirm by reading its last line (`return panel`) and add the return if missing. The plan card:
+`openModalPanel` in v1 returns `body` (the inset content frame v1's Source/Preview modals already rely on); it must also return `panel` (the outer frame with the title bar) for this section's code, without breaking those v1 callers. Change its last line to `return body, panel`, and have the two new call sites above destructure the second value (`local _, panel = openModalPanel(...)`) — leave v1's own `local body = openModalPanel(...)` call sites untouched. The plan card:
 ```lua
 local RISK_COLOR = { low = C.OK, medium = Color3.fromHex("f59e0b"), high = C.ERR }
 local function showPlanCard(plan)
@@ -2032,7 +2077,7 @@ local function showPlanCard(plan)
 		mk("Frame", { BackgroundColor3 = RISK_COLOR[s.risk], Size = UDim2.new(0, 8, 0, 8), Position = UDim2.new(0, 26, 0, 8) }, row)
 		local t = mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -110, 1, 0), Position = UDim2.new(0, 40, 0, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("%d. %s  [%s]  %s"):format(s.n, s.title, s.action, table.concat(s.targets, ", ")) }, row)
 		button("View", row, UDim2.new(0, 44, 0, 18), UDim2.new(1, -50, 0, 3), function()
-			GoalUI.prompt("detail", { title = ("Step %d"):format(s.n), text = s.detail .. "\n\nTargets:\n" .. table.concat(s.targets, "\n") })
+			GoalUI.view(("Step %d"):format(s.n), s.detail .. "\n\nTargets:\n" .. table.concat(s.targets, "\n"))
 		end)
 	end
 	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 99 }, f)
@@ -2045,7 +2090,7 @@ local function showPlanCard(plan)
 	approve.Parent = bar
 	button("Revise", bar, UDim2.new(0, 70, 1, 0), UDim2.new(0, 86, 0, 0), function()
 		local note = nil
-		local panel = openModalPanel("Revision note")
+		local _, panel = openModalPanel("Revision note")
 		local box = mk("TextBox", { BackgroundColor3 = C.CODEBG, Size = UDim2.new(1, -16, 0, 80), Position = UDim2.new(0, 8, 0, 34), Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.TEXT, TextWrapped = true, MultiLine = true, ClearTextOnFocus = false, Text = "" }, panel)
 		button("Send", panel, UDim2.new(0, 70, 0, 26), UDim2.new(0, 8, 0, 122), function() note = box.Text end)
 		while note == nil and widgetAlive() do task.wait(0.05) end
@@ -2141,28 +2186,39 @@ SelfTest.case("executor: off-target detection uses ancestors", function()
 		assert(Executor.isOffTarget(p, step2) == false, "ref target")
 	end)
 end)
-SelfTest.case("executor: batch under one recording, rollback on throw", function()
-	withScratch(function(f)
-		local s = Instance.new("Script"); s.Name = "S"; s.Source = "print(1)"; s.Parent = f
-		Goal.plan = { steps = { { n = 1, targets = { "ServerStorage.RSP_TestScratch" }, risk = "low" } } }
-		Goal.steps = { { n = 1, changed = {}, writes = {}, undoLabels = {} } }
-		local ps = { phase = "ACTING", step = Goal.plan.steps[1], myGen = Goal.gen, used = { calls = 0, tokens = 0 }, budget = { calls = 99, tokens = 1e9 }, consecutiveErrors = 0 }
-		local results, committed = Executor.runWriteBatch({
-			{ index = 1, name = "write_script", args = { target = "ServerStorage.RSP_TestScratch.S", source = "print(2)" } },
-			{ index = 2, name = "set_props", args = { targets = { "ServerStorage.RSP_TestScratch.S" }, props = { { name = "Nope", value = "1" } } } },
-		}, ps)
-		assert(committed == true, "committed")
-		assert(results[1].ok and s.Source == "print(2)", "script written")
-		assert(results[2].ok == true and results[2].rejected.Nope, "non-whitelisted prop reported, call still ok")
-		assert(#Goal.steps[1].changed == 1 and Goal.steps[1].changed[1].hashBefore ~= Goal.steps[1].changed[1].hashAfter, "changed bookkeeping")
-		local r2, c2 = Executor.runWriteBatch({
-			{ index = 1, name = "write_script", args = { target = "ServerStorage.RSP_TestScratch.S", source = "print(3)" } },
-			{ index = 2, name = "move", args = { targets = { "ServerStorage.RSP_TestScratch.S" }, newParent = "ServerStorage.DoesNotExist" } },
-		}, ps)
-		assert(c2 == false and s.Source == "print(2)", "batch rolled back when a write throws")
-		assert(r2[1].ok == false and r2[1].error:find("rolled back", 1, true), "collateral marked")
-		Goal.plan, Goal.steps = nil, {}
+SelfTest.case("executor: graceful failure keeps the batch, a throw rolls it back", function()
+	local okRun, err = pcall(function()
+		withScratch(function(f)
+			local s = Instance.new("Script"); s.Name = "S"; s.Source = "print(1)"; s.Parent = f
+			Goal.plan = { steps = { { n = 1, targets = { "ServerStorage.RSP_TestScratch" }, risk = "low" } } }
+			Goal.steps = { { n = 1, changed = {}, writes = {}, undoLabels = {} } }
+			local ps = { phase = "ACTING", step = Goal.plan.steps[1], myGen = Goal.gen, used = { calls = 0, tokens = 0 }, budget = { calls = 99, tokens = 1e9 }, consecutiveErrors = 0 }
+			-- A graceful {ok=false} is reported to the model but does NOT roll the batch back (§8.3).
+			local results, committed = Executor.runWriteBatch({
+				{ index = 1, name = "write_script", args = { target = "ServerStorage.RSP_TestScratch.S", source = "print(2)" } },
+				{ index = 2, name = "set_props", args = { targets = { "ServerStorage.RSP_TestScratch.S" }, props = { { name = "Nope", value = "1" } } } },
+			}, ps)
+			assert(committed == true, "a graceful failure keeps the batch")
+			assert(results[1].ok and s.Source == "print(2)", "script written")
+			assert(results[2].ok == false and results[2].rejected.Nope, "nothing applied means ok=false, with the reason")
+			assert(#Goal.steps[1].changed == 1 and Goal.steps[1].changed[1].hashBefore ~= Goal.steps[1].changed[1].hashAfter, "one script change recorded")
+			assert(#Goal.steps[1].undoLabels == 1, "one recording committed")
+			-- A throw cancels the recording and refuses the rest of the batch (§8.3).
+			Tools.write.__test_throw = function() error("boom") end
+			local r2, c2 = Executor.runWriteBatch({
+				{ index = 1, name = "write_script", args = { target = "ServerStorage.RSP_TestScratch.S", source = "print(3)" } },
+				{ index = 2, name = "__test_throw", args = {} },
+			}, ps)
+			Tools.write.__test_throw = nil
+			assert(c2 == false and s.Source == "print(2)", "the throw rolled the batch back")
+			assert(r2[2].ok == false and r2[2].error:find("write crashed", 1, true), "the throwing call reports its crash")
+			assert(r2[1].ok == false and r2[1].error:find("rolled back", 1, true), "its sibling is marked collateral")
+			assert(#Goal.steps[1].changed == 1 and #Goal.steps[1].undoLabels == 1, "rollback truncated only this batch's bookkeeping")
+		end)
 	end)
+	Tools.write.__test_throw = nil
+	Goal.plan, Goal.steps = nil, {}
+	assert(okRun, err)
 end)
 ```
 Reload with `DEV = true`. Expected: four FAIL lines.
@@ -2172,7 +2228,8 @@ Reload with `DEV = true`. Expected: four FAIL lines.
 ```lua
 do
 	function Tools.syntaxCheck(source)
-		local fn, err = loadstring(source)
+		local ok, fn, err = pcall(loadstring, source)
+		if not ok then return false, "could not compile: " .. tostring(fn) end
 		if fn then return true end
 		return false, tostring(err)
 	end
@@ -2228,19 +2285,41 @@ do
 	end
 	local function protected(inst)
 		local root = Store.root()
-		return (root and inst:IsDescendantOf(root)) or inst:IsDescendantOf(game:GetService("CoreGui"))
+		return (root and (inst == root or inst:IsDescendantOf(root))) or inst:IsDescendantOf(game:GetService("CoreGui"))
 	end
 	local function currentSource(inst, ctx)
 		return (ctx and ctx.simulated and ctx.simulated[inst]) or Tools.readSource(inst)
 	end
-	local function applySource(inst, newSource, ctx, tool, extra)
-		local okS, serr = Tools.syntaxCheck(newSource)
-		if not okS then return { ok = false, error = "syntax error: " .. serr } end
-		if ctx.dryRun then ctx.simulated[inst] = newSource; return { ok = true, dry = true, newSource = newSource } end
-		local ok, err = Tools.writeSource(inst, function() return newSource end)
-		if not ok then return { ok = false, error = err } end
-		ctx.simulated[inst] = newSource
-		local r = { ok = true, path = inst:GetFullName(), ref = Tools.ref(inst), hash = Store.hash(newSource), tool = tool }
+	-- compute(old) -> new | nil, err. It runs INSIDE UpdateSourceAsync's callback so the edit
+	-- lands on the source the editor actually holds at write time, not on a copy read before
+	-- the yield. The syntax gate runs on the computed source inside the callback too; the
+	-- callback must not yield, and loadstring does not. err may be a full result table.
+	local function applySource(inst, compute, ctx, tool, extraOf)
+		if ctx.dryRun then
+			local base = currentSource(inst, ctx)
+			local new, cerr = compute(base)
+			if not new then return type(cerr) == "table" and cerr or { ok = false, error = tostring(cerr) } end
+			local okS, serr = Tools.syntaxCheck(new)
+			if not okS then return { ok = false, error = "syntax error: " .. serr } end
+			ctx.simulated[inst] = new
+			return { ok = true, dry = true, newSource = new }
+		end
+		local landed, extra, failErr
+		local ok, err = Tools.writeSource(inst, function(old)
+			local new, cerr = compute(old)
+			if not new then failErr = cerr; return nil, "compute rejected" end
+			local okS, serr = Tools.syntaxCheck(new)
+			if not okS then failErr = "syntax error: " .. serr; return nil, failErr end
+			landed = new
+			extra = extraOf and extraOf(old, new) or nil
+			return new
+		end)
+		if not ok or not landed then
+			if type(failErr) == "table" then return failErr end
+			return { ok = false, error = failErr or err or "write failed" }
+		end
+		ctx.simulated[inst] = landed
+		local r = { ok = true, path = inst:GetFullName(), ref = Tools.ref(inst), hash = Store.hash(landed), tool = tool }
 		for k, v in pairs(extra or {}) do r[k] = v end
 		return r
 	end
@@ -2248,56 +2327,65 @@ do
 	function Tools.write.replace_lines(args, ctx)
 		local inst, err = scriptTarget(args.target); if not inst then return { ok = false, error = err } end
 		if protected(inst) then return { ok = false, error = "target is protected" } end
-		local src = currentSource(inst, ctx)
-		if Store.hash(src) ~= tostring(args.expectHash) then return { ok = false, error = "expectHash does not match the current source; read_script again" } end
-		local lines = src:split("\n")
-		local from, to = tonumber(args.fromLine), tonumber(args.toLine)
-		if not from or not to or from < 1 or to < from or to > #lines then return { ok = false, error = ("line range out of bounds (1..%d)"):format(#lines) } end
-		local out = {}
-		for i = 1, from - 1 do table.insert(out, lines[i]) end
-		for _, l in ipairs(tostring(args.newText or ""):split("\n")) do table.insert(out, l) end
-		for i = to + 1, #lines do table.insert(out, lines[i]) end
-		return applySource(inst, table.concat(out, "\n"), ctx, "replace_lines", { from = from, to = to, newLines = select(2, tostring(args.newText or ""):gsub("\n", "")) + 1 })
+		return applySource(inst, function(old)
+			if Store.hash(old) ~= tostring(args.expectHash) then
+				return nil, { ok = false, error = "expectHash does not match the current source; read_script again" }
+			end
+			local lines = old:split("\n")
+			local from, to = tonumber(args.fromLine), tonumber(args.toLine)
+			if not from or not to or from % 1 ~= 0 or to % 1 ~= 0 or from < 1 or to < from or to > #lines then
+				return nil, { ok = false, error = ("line range must be whole numbers within 1..%d"):format(#lines) }
+			end
+			local out = {}
+			for i = 1, from - 1 do table.insert(out, lines[i]) end
+			for _, l in ipairs(tostring(args.newText or ""):split("\n")) do table.insert(out, l) end
+			for i = to + 1, #lines do table.insert(out, lines[i]) end
+			return table.concat(out, "\n")
+		end, ctx, "replace_lines", function()
+			return { from = tonumber(args.fromLine), to = tonumber(args.toLine), newLines = select(2, tostring(args.newText or ""):gsub("\n", "")) + 1 }
+		end)
 	end
 
 	function Tools.write.edit_script(args, ctx)
 		local inst, err = scriptTarget(args.target); if not inst then return { ok = false, error = err } end
 		if protected(inst) then return { ok = false, error = "target is protected" } end
-		local src = currentSource(inst, ctx)
 		local find, rep = tostring(args.find or ""), tostring(args.replace or "")
 		if #find == 0 then return { ok = false, error = "empty find" } end
-		local first = src:find(find, 1, true)
-		if not first then
-			-- nearest: best single-line match of find's first non-blank line
-			local probe = find:match("([^\n]*%S[^\n]*)") or find
-			local lines = src:split("\n")
-			local bestI = nil
-			for i, l in ipairs(lines) do if l:find(probe, 1, true) then bestI = i; break end end
-			local near = {}
-			if bestI then for i = math.max(1, bestI - 3), math.min(#lines, bestI + 3) do table.insert(near, i .. "\t" .. lines[i]) end end
-			return { ok = false, error = "find not found", nearest = table.concat(near, "\n") }
-		end
-		local second = src:find(find, first + #find, true)
-		if second and not args.all then
-			local count, pos, ln = 0, 1, {}
-			while true do local s = src:find(find, pos, true); if not s then break end; count += 1; table.insert(ln, select(2, src:sub(1, s):gsub("\n", "")) + 1); pos = s + #find end
-			return { ok = false, error = ("find matches %d times; set all=true or make it unique"):format(count), lines = ln }
-		end
-		local new
-		if args.all then
-			new = src:gsub(find:gsub("%W", "%%%0"), (rep:gsub("%%", "%%%%")))
-		else
-			new = src:sub(1, first - 1) .. rep .. src:sub(first + #find)
-		end
-		return applySource(inst, new, ctx, "edit_script", { find = utf8Trim(find, 400), replace = utf8Trim(rep, 400) })
+		return applySource(inst, function(old)
+			local first = old:find(find, 1, true)
+			if not first then
+				-- nearest: best single-line match of find's first non-blank line
+				local probe = find:match("([^\n]*%S[^\n]*)") or find
+				local lines = old:split("\n")
+				local bestI = nil
+				for i, l in ipairs(lines) do if l:find(probe, 1, true) then bestI = i; break end end
+				local near = {}
+				if bestI then for i = math.max(1, bestI - 3), math.min(#lines, bestI + 3) do table.insert(near, i .. "\t" .. lines[i]) end end
+				return nil, { ok = false, error = "find not found", nearest = table.concat(near, "\n") }
+			end
+			local second = old:find(find, first + #find, true)
+			if second and not args.all then
+				local count, pos, ln = 0, 1, {}
+				while true do local s = old:find(find, pos, true); if not s then break end; count += 1; table.insert(ln, select(2, old:sub(1, s):gsub("\n", "")) + 1); pos = s + #find end
+				return nil, { ok = false, error = ("find matches %d times; set all=true or make it unique"):format(count), lines = ln }
+			end
+			if args.all then
+				return (old:gsub(find:gsub("%W", "%%%0"), (rep:gsub("%%", "%%%%"))))
+			else
+				return old:sub(1, first - 1) .. rep .. old:sub(first + #find)
+			end
+		end, ctx, "edit_script", function()
+			return { find = utf8Trim(find, 400), replace = utf8Trim(rep, 400) }
+		end)
 	end
 
 	function Tools.write.write_script(args, ctx)
 		local inst, err = scriptTarget(args.target); if not inst then return { ok = false, error = err } end
 		if protected(inst) then return { ok = false, error = "target is protected" } end
 		local new = tostring(args.source or "")
-		local old = currentSource(inst, ctx)
-		return applySource(inst, new, ctx, "write_script", { linesChanged = Tools.lineDiffPercent(old, new), newLines = select(2, new:gsub("\n", "")) + 1 })
+		return applySource(inst, function(old) return new end, ctx, "write_script", function(old)
+			return { linesChanged = Tools.lineDiffPercent(old, new), newLines = select(2, new:gsub("\n", "")) + 1 }
+		end)
 	end
 
 	local function applyProps(inst, props)
@@ -2362,7 +2450,7 @@ do
 		-- flatten for the single-target common case
 		if type(args.targets) == "table" and #args.targets == 1 then
 			local only = r.results[args.targets[1]]
-			if only then only.ok = only.ok or #only.applied > 0; return only end
+			if only then return only end
 		end
 		return r
 	end
@@ -2395,6 +2483,11 @@ end
 ```lua
 local Executor = {}
 do
+	-- Only these three write tools change a script's source text; only they get a
+	-- "before" snapshot and a changed[] entry keyed by source hash. A set_props/move/
+	-- trash call whose target happens to be a script must NOT be mistaken for a source edit.
+	local SOURCE_TOOLS = { write_script = true, edit_script = true, replace_lines = true }
+
 	function Executor.isOffTarget(inst, step)
 		for _, t in ipairs(step.targets or {}) do
 			local declared = Tools.resolve(t)
@@ -2403,7 +2496,9 @@ do
 		return true
 	end
 
-	-- Pre-walk (no writes): simulate sources, decide prompts. Returns prompts list and per-write skip set.
+	-- Pre-walk (no writes): simulate sources, decide prompts. Runs entirely before any
+	-- recording opens, so a human decision (GoalUI.prompt, in the caller) never holds one
+	-- open. Returns a list of { write, reason, inst } for calls that need a prompt.
 	local function preWalk(writes, ps, ctx)
 		local prompts = {}
 		local careful = S.get("goal_careful", false) == true
@@ -2427,7 +2522,8 @@ do
 				if oldLines > 200 and pct > 50 and not declaredHigh then reason = reason or ("rewrite %s: %d lines, %d%% changed"):format(inst:GetFullName(), oldLines, pct) end
 			end
 			if careful and not reason then reason = "Careful mode: " .. w.name end
-			-- simulate so later calls in the batch see this one
+			-- simulate so later calls in the batch see this one; a dryRun copy of ctx (table.clone
+			-- shares ctx.simulated by reference but flips dryRun) guarantees no real write lands here
 			if inst and (w.name == "write_script" or w.name == "edit_script" or w.name == "replace_lines") then
 				local dry = table.clone(ctx); dry.dryRun = true
 				local r = Tools.write[w.name](w.args, dry)
@@ -2442,9 +2538,15 @@ do
 		local a = table.clone(w.args)
 		if a.source then a.source = utf8Trim(a.source, 3000) end
 		if a.newText then a.newText = utf8Trim(a.newText, 3000) end
+		if a.find then a.find = utf8Trim(a.find, 3000) end
+		if a.replace then a.replace = utf8Trim(a.replace, 3000) end
 		return HttpService:JSONEncode(a)
 	end
 
+	-- The one recording-gated write path. Prompts are collected and answered BEFORE
+	-- TryBeginRecording, so a human decision never holds a recording open. The whole
+	-- batch runs under a single recording: only a THROW (§8.3) cancels it — a graceful
+	-- {ok=false} result is reported to the model and the batch still commits.
 	function Executor.runWriteBatch(writes, ps)
 		local results = {}
 		local function refuseAll(msg, attributable)
@@ -2461,38 +2563,46 @@ do
 			if answer == "stop" then Agent.stop(); return refuseAll("stopped by Jasper", false)
 			elseif answer == "skip" then skip[p.write.index] = true end
 		end
-		ctx.simulated = {} -- real run recomputes
-		local label = ("Step %d"):format(step.n) .. (ps.batches and ps.batches > 0 and (", part " .. (ps.batches + 1)) or "")
+		ctx.simulated = {} -- discard the pre-walk simulation; the real run recomputes as writes commit
+		local base = (step.n == 0) and "Repair" or ("Step %d"):format(step.n)
+		local label = base .. (ps.batches and ps.batches > 0 and (", part " .. (ps.batches + 1)) or "")
 		local rec = ChangeHistoryService:TryBeginRecording("RoScriptPro " .. label, "RoScript Pro: " .. label)
-		if not rec then return refuseAll("undo unavailable, writes refused", false) end
+		if not rec then return refuseAll("undo unavailable, writes refused", false) end -- no recording => no write
 		Goal.openRecording = { id = rec, owner = coroutine.running() }
 		ps.batches = (ps.batches or 0) + 1
 		local bookkeeping = Goal.steps[step.n]
+		bookkeeping.beforeSources = bookkeeping.beforeSources or {}
+		local changedAt, writesAt = #bookkeeping.changed, #bookkeeping.writes -- this batch's start, for a scoped rollback
 		local committed = true
 		local failedAt = nil
 		for _, w in ipairs(writes) do
 			if skip[w.index] then
 				results[w.index] = { ok = false, error = "skipped by Jasper", attributable = false }
 			else
-				-- capture before-state for Revert
 				local target = w.args.target or (type(w.args.targets) == "table" and w.args.targets[1])
 				local inst = target and Tools.resolve(target)
-				local before = inst and inst:IsA("LuaSourceContainer") and Tools.readSource(inst) or nil
+				local isSourceWrite = SOURCE_TOOLS[w.name] and inst and inst:IsA("LuaSourceContainer")
+				local before = isSourceWrite and Tools.readSource(inst) or nil
 				local okCall, r = pcall(Tools.write[w.name], w.args, ctx)
 				if not okCall then r = { ok = false, error = "write crashed: " .. tostring(r) }; failedAt = w.index end
+				-- UpdateSourceAsync (inside the pcall above) is the one bounded yield allowed
+				-- inside this recording; re-check gen the moment it returns.
 				if not Agent.checkGen(ps.myGen) then
-					-- UpdateSourceAsync may have yielded across a Stop: we own the recording, so we cancel it.
+					-- we opened this recording, so only we may finish it (never called twice on one id)
 					ChangeHistoryService:FinishRecording(rec, Enum.FinishRecordingOperation.Cancel)
 					Goal.openRecording = nil
 					return refuseAll("stopped", false)
 				end
 				results[w.index] = r
-				if r.ok and inst and before then
+				-- §8.3: only a throw (pcall failure, above) rolls the batch back. A graceful
+				-- {ok=false} — a stale hash, an ambiguous find, nothing whitelisted applied —
+				-- is reported to the model and the batch still commits; that outcome is meant
+				-- to be read and retried, not to void sibling writes that already succeeded.
+				if r.ok and isSourceWrite and before then
 					local k = #bookkeeping.changed + 1
-					bookkeeping.beforeSources = bookkeeping.beforeSources or {}
 					bookkeeping.beforeSources[k] = before
 					table.insert(bookkeeping.changed, { path = r.path or inst:GetFullName(), ref = Tools.ref(inst), kind = "script", hashBefore = Store.hash(before), hashAfter = r.hash or Tools.hashOf(inst), before = "before/" .. k })
-				elseif r.ok and (r.created or r.moved or r.trashed or r.results) then
+				elseif r.ok and (r.created or r.moved or r.trashed or r.results or r.applied) then
 					local entries = r.results or { [r.path or "?"] = r }
 					for _, e in pairs(entries) do
 						if e.ok then table.insert(bookkeeping.changed, { path = e.path, ref = e.ref, kind = "instance", origParent = e.origParent, created = e.created, trashed = e.trashed }) end
@@ -2512,19 +2622,28 @@ do
 			for _, w in ipairs(writes) do
 				if w.index ~= failedAt and not skip[w.index] then results[w.index] = { ok = false, error = "batch rolled back", attributable = false } end
 			end
-			-- bookkeeping added during this batch is dropped
-			bookkeeping.changed, bookkeeping.writes = {}, {}
-			bookkeeping.beforeSources = nil
+			-- undo only THIS batch's bookkeeping; a step can span several batches and an
+			-- earlier committed batch's entries must survive a later batch's rollback
+			for k = #bookkeeping.changed, changedAt + 1, -1 do
+				bookkeeping.beforeSources[k] = nil
+				table.remove(bookkeeping.changed, k)
+			end
+			for k = #bookkeeping.writes, writesAt + 1, -1 do table.remove(bookkeeping.writes, k) end
 		else
 			ChangeHistoryService:FinishRecording(rec, Enum.FinishRecordingOperation.Commit)
 			table.insert(bookkeeping.undoLabels, "RoScript Pro: " .. label)
+			GoalUI.log(("%s: %d write%s"):format(label, #writes, #writes == 1 and "" or "s"), "ok")
 		end
 		Goal.openRecording = nil
 		return results, committed
 	end
 end
 ```
-Rollback bookkeeping note: a step may have several batches; the "dropped" reset above wipes earlier committed batches' entries too. Fix it in the same task: snapshot `#bookkeeping.changed` and `#bookkeeping.writes` before the loop and truncate back to those counts on rollback instead of clearing.
+Rollback bookkeeping: a step may have several batches, so a rolled-back batch truncates
+`bookkeeping.changed`/`.writes` back to the counts captured before its own loop
+(`changedAt`/`writesAt`) instead of clearing them outright — an earlier committed batch's
+entries survive a later batch's rollback. `beforeSources` keys added during the rolled-back
+batch are removed the same way, by the same `k` values used at insertion.
 
 - [ ] **Step 5: Reload and verify green**
 
@@ -2706,8 +2825,9 @@ function Agent.retryStep(n)
 	if Goal.phase ~= "ACTING" then return end
 	local step = Goal.plan.steps[n]
 	local prev = Goal.steps[n] and Goal.steps[n].outcome or ""
-	step.detail = step.detail .. "\n[previous attempt failed: " .. prev .. "]"
-	for k = n, #Goal.plan.steps do if Goal.steps[k] and Goal.steps[k].status == "skipped" and Goal.steps[k].outcome:find("not run", 1, true) then Goal.steps[k] = nil end end
+	step.baseDetail = step.baseDetail or step.detail
+	step.detail = step.baseDetail .. "\n[previous attempt failed: " .. utf8Trim(prev, 300) .. "]"
+	for k = n + 1, #Goal.plan.steps do if Goal.steps[k] and Goal.steps[k].status == "skipped" and Goal.steps[k].outcome:find("not run", 1, true) then Goal.steps[k] = nil end end
 	Goal.gen += 1
 	runFrom(n)
 end
@@ -2739,7 +2859,7 @@ end
 
 - [ ] **Step 3: Act log batch View and the failure card (section 11)**
 
-Extend `GoalUI.log` calls from the Executor: after a committed batch, call `GoalUI.log(("Step %d · %s · %s"):format(step.n, w.name, r.path or ""), "muted")` per write inside `Executor.runWriteBatch` (add after `results[w.index] = r` when `r.ok`). Add a `View` affordance: `GoalUI.logBatch(step, writes, results)` creates a row with a button that opens `GoalUI.prompt("batch", { title = "Step n writes", text = <per-write description> })`. Implementation:
+Add a `View` affordance: `GoalUI.logBatch(step, writes, results)` creates a row with a button that opens `GoalUI.view(("Step %d writes"):format(step.n), <per-write description>)`. This is the act log's only record of what a batch did — no per-write `GoalUI.log` inside the write loop, since a later throw in the same batch rolls those writes back and would leave a stale success line for one that did not survive. Implementation:
 ```lua
 GoalUI.logBatch = function(step, writes, results)
 	local logCard = goalScroll:FindFirstChild("ActLog") or card("Act log")
@@ -2755,13 +2875,28 @@ GoalUI.logBatch = function(step, writes, results)
 			if a.newText then a.newText = utf8Trim(a.newText, 3000) end
 			table.insert(lines, ("%s → %s\n%s"):format(w.name, r.ok and "ok" or ("FAILED: " .. tostring(r.error)), HttpService:JSONEncode(a)))
 		end
-		GoalUI.prompt("batch", { title = ("Step %d writes"):format(step.n), text = table.concat(lines, "\n\n") })
+		GoalUI.view(("Step %d writes"):format(step.n), table.concat(lines, "\n"))
 	end)
 end
 ```
-Call it at the end of `Executor.runWriteBatch` before returning (both branches). The failure card:
+Call it at the end of `Executor.runWriteBatch` before returning (both branches). `GoalUI.view` is the read-only modal defined alongside `GoalUI.prompt` (immediately after it, in the `GoalUI.*` assignment cluster) — every "View" affordance in this file (this one, and the plan card's per-step View from Task 6) uses it, since a settled batch or a step's detail is nothing left to decide on:
+```lua
+-- Read-only modal: no decision to make, just a Close button. Every "View" affordance
+-- uses this; GoalUI.prompt is only for a write that is waiting on an answer.
+GoalUI.view = function(title, text)
+	local _, panel = openModalPanel(title)
+	local body = mk("ScrollingFrame", { BackgroundColor3 = C.CODEBG, Size = UDim2.new(1, -16, 1, -80), Position = UDim2.new(0, 8, 0, 34), AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarThickness = 6 }, panel)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, body)
+	for i, chunk in ipairs(chunkText(text or "")) do
+		mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, RichText = true, Text = escapeRich(chunk), LayoutOrder = i }, body)
+	end
+	button("Close", panel, UDim2.new(0, 70, 0, 26), UDim2.new(0, 8, 1, -34), closeModal)
+end
+```
+The failure card:
 ```lua
 local function showFailureCard(step)
+	local old = goalScroll:FindFirstChild("FailureCard"); if old then old:Destroy() end
 	local f = card(("Step %d failed"):format(step.n)); f.Name = "FailureCard"
 	label(f, Goal.steps[step.n].outcome or "", C.ERR, 1)
 	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 2 }, f)
@@ -2789,15 +2924,15 @@ git commit -m "goal-mode: ACTING phase with per-step conversations, act log, Ret
 ### Task 9: RECORDING, result card, Plans view, Revert, Trash view — the cut line
 
 **Files:**
-- Modify: `studio-plugin/RoScriptPro.lua` sections `10. AGENT` (replace the `Agent.record` stub), `11. GOAL UI` (result card, Plans view, Trash view), `8. STORE` (Facts generator helper).
+- Modify: `studio-plugin/RoScriptPro.lua` sections `10. AGENT` (replace the `Agent.record` stub, `buildFacts` Facts generator helper), `11. GOAL UI` (result card, Plans view, Trash view).
 
 **Interfaces:**
 - Consumes: `Store.*`, `Goal.*`, `Schemas.forPhase("RECORDING")`, `requestWithWaits`, `runPhaseLoop`, `Tools.resolve/readSource/writeSource/hashOf`, `ChangeHistoryService.OnUndo/OnRedo`.
 - Produces:
   - `Agent.record(status: string)` — builds the record, one `write_memory` turn, one `RoScript Pro: record` recording, caps, result card, `Goal.phase = "IDLE"`
-  - `buildFacts() -> string` (≤ `FACTS_MAX`)
+  - `buildFacts() -> string` (≤ `FACTS_MAX`), defined in section `10. AGENT` right alongside `Agent.record`, not in `8. STORE`
   - `Agent.revertPlan(id) -> ok, report: {restored = {}, skipped = {}}`
-  - `GoalUI.showCard("result", record)`, `GoalUI.refreshPlans()`, Plans view (`showPlansView()`), Trash view (`showTrashView()`)
+  - `GoalUI.showCard("result", record)`, `GoalUI.refreshPlans()`, Plans view (`showPlansView()`), Trash view (`showTrashView()`) — both forward-declared as locals in section `11. GOAL UI` (`local showPlansView, showTrashView`, Step 4 below), next to `buildGoalView`'s other UI locals, and then assigned with `showPlansView = function(offset) … end` / `showTrashView = function() … end`, not `local function`, so `buildGoalView`'s button row (which references them before either assignment runs) closes over this same upvalue instead of shadowing it
 
 - [ ] **Step 1: Write the failing self-tests**
 
@@ -2826,10 +2961,12 @@ SelfTest.case("record: revert restores untouched scripts and skips edited ones",
 		local ok, report = Agent.revertPlan("Plan_900_revert-test")
 		assert(ok and #report.restored == 1 and #report.skipped == 1, ("restored %d skipped %d"):format(#report.restored, #report.skipped))
 		assert(a.Source == "print('before A')" and b.Source:find("hand edit", 1, true), "A reverted, B skipped")
-		root.Plans.Plan_900_revert-test:Destroy()
+		root.Plans["Plan_900_revert-test"]:Destroy()
 	end)
 end)
 ```
+`root.Plans.Plan_900_revert-test:Destroy()` does not parse as Luau — the hyphen in the plan id reads as subtraction between two undeclared globals. Index with brackets instead, as above.
+
 Reload with `DEV = true`. Expected: three FAIL lines. (Run in a place without a real store, or accept the test record being pruned later.)
 
 - [ ] **Step 2: Facts, status, the record turn**
@@ -2897,7 +3034,9 @@ function Agent.record(status)
 		if not Agent.checkGen(myGen) then return end
 		local steps = {}
 		for n, b in pairs(Goal.steps) do
-			steps[#steps + 1] = { n = n, status = b.status, outcome = b.outcome, changed = b.changed, writes = b.writes, undoLabels = b.undoLabels }
+			if n ~= 0 then -- belt and braces: a repair's step 0 bookkeeping must never reach the record (see Agent.repair, Task 10)
+				steps[#steps + 1] = { n = n, status = b.status, outcome = b.outcome, changed = b.changed, writes = b.writes, undoLabels = b.undoLabels }
+			end
 		end
 		table.sort(steps, function(x, y) return x.n < y.n end)
 		local record = {
@@ -2931,14 +3070,40 @@ function Agent.record(status)
 			if not Agent.checkGen(myGen) then return end
 		end
 		record.summary = summary
-		local beforeSources = {}
-		for n, b in pairs(Goal.steps) do
-			for k, src in pairs(b.beforeSources or {}) do beforeSources[#beforeSources + 1] = src end
-		end
-		-- re-key changed[].before to the flattened numbering
-		local k = 0
+		-- Build the flattened before/k sources in the SAME pass, over the SAME sorted order
+		-- (record.steps, ascending n), that rewrites ch.before: each step's own beforeSources
+		-- map is read using the ORIGINAL per-step index parsed out of ch.before (Executor.
+		-- runWriteBatch numbers beforeSources/changed[].before locally per step, restarting at
+		-- 1 for every step), and only THEN is ch.before rewritten to the new global index. A
+		-- second, independently-ordered pass (e.g. pairs(Goal.steps) for one loop and the
+		-- sorted record.steps array for the other, as a plain flatten-then-rekey would do)
+		-- could pair one script's ch.before with a DIFFERENT step's source text whenever the
+		-- two orders disagreed, and Revert would then silently overwrite the wrong script with
+		-- the wrong old source.
+		local beforeSources, k = {}, 0
 		for _, st in ipairs(record.steps) do
-			for _, ch in ipairs(st.changed or {}) do if ch.before then k += 1; ch.before = "before/" .. k end end
+			local b = Goal.steps[st.n]
+			for _, ch in ipairs(st.changed or {}) do
+				if ch.before then
+					k += 1
+					beforeSources[k] = (b and b.beforeSources and b.beforeSources[tonumber(ch.before:match("before/(%d+)"))]) or ""
+					ch.before = "before/" .. k
+				end
+			end
+		end
+		-- A repair's own edits (Task 10) get the same before/k treatment, over the SAME
+		-- global k, placed AFTER the steps so they take the highest indices — Revert
+		-- unwinds the repair first (newest writes), then the steps, matching that walk.
+		local rp = record.verify and record.verify.repair
+		if rp and rp.changed then
+			for _, ch in ipairs(rp.changed) do
+				if ch.before then
+					k += 1
+					beforeSources[k] = (rp.beforeSources and rp.beforeSources[tonumber(ch.before:match("before/(%d+)"))]) or ""
+					ch.before = "before/" .. k
+				end
+			end
+			rp.beforeSources = nil -- raw source belongs in before/ chunks, never in the record JSON
 		end
 		local ok, err = Store.withRecording("record", function()
 			Store.writeMemory(facts, newNotes)
@@ -2946,7 +3111,14 @@ function Agent.record(status)
 			Store.writePlan(record, beforeSources)
 			Store.applyCaps()
 		end)
-		if not ok then GoalUI.log("record not written: " .. tostring(err), "error") end
+		if not ok then
+			GoalUI.log("record NOT written: " .. tostring(err) .. " — the game changes stand, but this cycle was not saved", "error")
+			Goal.phase = "IDLE"
+			GoalUI.setBusy(false)
+			GoalUI.setPhase("IDLE", "record failed")
+			GoalUI.refreshPlans()
+			return
+		end
 		Goal.phase = "IDLE"
 		GoalUI.setBusy(false)
 		GoalUI.setPhase("IDLE", record.id .. " · " .. record.status)
@@ -2955,7 +3127,11 @@ function Agent.record(status)
 	end)
 end
 ```
-The `beforeSources` flattening assumes each step's `changed[].before` were numbered per step in Task 7 (`"before/" .. k` with `k` local to the step); the re-key loop above renumbers them globally in step order, matching the order the sources are appended. Iterate `Goal.steps` in ascending `n` in both loops (use the sorted `steps` array's `n` values, not `pairs`).
+Each step's own `changed[].before` was numbered LOCAL to that step by Executor.runWriteBatch (`"before/" .. k` with `k` restarting at 1 for every step). The pass above builds the record's sorted `steps` array first, then produces `beforeSources` and the new global `before/k` keys in ONE walk over that same sorted order, reading each step's own `beforeSources` map by the ORIGINAL per-step index parsed out of `ch.before` before rewriting it. Building the global key and the source lookup in two independently-ordered passes (e.g. flattening via `pairs(Goal.steps)` while re-keying from the sorted array) risks the two orders disagreeing — `Goal.steps` can develop holes and out-of-insertion-order entries via `Agent.retryStep`/`Agent.continueFrom` — and Revert would then silently restore the wrong script's old source into a different script.
+
+If the record write itself fails (`Store.withRecording` returns `false`), the game's changes already made by the plan stand, but nothing is persisted: no result card, no misleading Revert button pointing at a plan record that does not exist. Log it, drop back to `IDLE`, refresh the Plans/Trash button counts, and return — do not fall through to `GoalUI.showCard("result", record)`.
+
+**Task 10 fix-round mirror (`Agent.record` is defined here, so both land in this sample):** the step-collection loop skips `n == 0` (a repair's scratch bookkeeping, see Task 10's `Agent.repair`, must never reach a written record — F3); and a second `beforeSources` pass, sharing the same `k` and running immediately after the steps loop, covers `record.verify.repair.changed` too, so a repair's own edits get `before/k` chunks the same way a step's do, then strips the transient `rp.beforeSources` map before the record is persisted (F4). Both are prerequisites for `Agent.revertPlan` (Step 3, below) being able to unwind a repair's edits.
 
 - [ ] **Step 3: Revert**
 
@@ -2966,46 +3142,77 @@ function Agent.revertPlan(id)
 	local report = { restored = {}, skipped = {} }
 	local root = Store.root()
 	local folder = root and root.Plans:FindFirstChild(id)
-	local ok, werr = Store.withRecording("revert " .. id, function()
-		for i = #rec.steps, 1, -1 do
-			local st = rec.steps[i]
-			for j = #(st.changed or {}), 1, -1 do
-				local ch = st.changed[j]
-				local inst = walkPath(ch.path)
-				if ch.kind == "script" and ch.before then
-					local beforeFolder = folder and folder:FindFirstChild("before") and folder.before:FindFirstChild(ch.before:match("before/(.+)"))
-					if inst and inst:IsA("LuaSourceContainer") and beforeFolder then
-						if Tools.hashOf(inst) == ch.hashAfter then
-							local src = Store.readText(beforeFolder)
-							assert(Tools.writeSource(inst, function() return src end))
-							table.insert(report.restored, ch.path)
-						else
-							table.insert(report.skipped, ch.path .. " (edited since)")
-						end
+	-- Shared by both the repair walk and the steps walk below, so the restore/skip logic
+	-- for one changed[] entry exists in exactly one place.
+	local function revertChange(ch)
+		local inst = walkPath(ch.path)
+		if ch.kind == "script" and ch.before then
+			local beforeFolder = folder and folder:FindFirstChild("before") and folder.before:FindFirstChild(ch.before:match("before/(.+)"))
+			if inst and inst:IsA("LuaSourceContainer") and beforeFolder then
+				if Tools.hashOf(inst) == ch.hashAfter then
+					local src = Store.readText(beforeFolder)
+					local okW, wErr = Tools.writeSource(inst, function() return src end)
+					if okW then
+						table.insert(report.restored, ch.path)
 					else
-						table.insert(report.skipped, ch.path .. " (missing)")
+						table.insert(report.skipped, ch.path .. " (write failed: " .. tostring(wErr) .. ")")
 					end
-				elseif ch.created and inst then
-					Store.trash(inst, id .. "-revert"); table.insert(report.restored, ch.path .. " (trashed)")
-				elseif (ch.trashed or ch.origParent) then
-					local item = nil
-					for _, it in ipairs(Store.trashItems()) do if it:GetAttribute("RSP_OrigName") == ch.path:match("([^.]+)$") and it:GetAttribute("RSP_Plan") == id then item = it end end
-					local target = item or inst
-					local parent = ch.origParent and walkPath(ch.origParent)
-					if target and parent then target.Parent = parent; table.insert(report.restored, ch.path) else table.insert(report.skipped, ch.path .. " (origin missing)") end
+				else
+					table.insert(report.skipped, ch.path .. " (edited since)")
+				end
+			else
+				table.insert(report.skipped, ch.path .. " (missing)")
+			end
+		elseif ch.created and inst then
+			local okT, tErr = pcall(Store.trash, inst, id .. "-revert")
+			if okT then
+				table.insert(report.restored, ch.path .. " (trashed)")
+			else
+				table.insert(report.skipped, ch.path .. " (could not trash: " .. tostring(tErr) .. ")")
+			end
+		elseif (ch.trashed or ch.origParent) then
+			local item = nil
+			for _, it in ipairs(Store.trashItems()) do
+				local parent, name = it:GetAttribute("RSP_OrigParent"), it:GetAttribute("RSP_OrigName")
+				if it:GetAttribute("RSP_Plan") == id and parent and name and (parent .. "." .. name) == ch.path then
+					item = it
+					break
 				end
 			end
+			local target = item or inst
+			local parent = ch.origParent and walkPath(ch.origParent)
+			if target and parent then target.Parent = parent; table.insert(report.restored, ch.path) else table.insert(report.skipped, ch.path .. " (origin missing)") end
+		else
+			table.insert(report.skipped, tostring(ch.path) .. " (no longer present)")
+		end
+	end
+	local ok, werr = Store.withRecording("revert " .. id, function()
+		-- Repair's edits are the newest writes, so they unwind first, then the steps.
+		local rp = rec.verify and rec.verify.repair
+		if rp and rp.changed then
+			for j = #rp.changed, 1, -1 do revertChange(rp.changed[j]) end
+		end
+		for i = #rec.steps, 1, -1 do
+			local st = rec.steps[i]
+			for j = #(st.changed or {}), 1, -1 do revertChange(st.changed[j]) end
 		end
 	end)
 	if not ok then return false, { error = werr } end
 	return true, report
 end
 ```
+Five fixes from the review pass (the fourth and fifth applied in Task 10, carried over from Task 9's review as same-shape or same-honesty-class defects):
+- **The old-source write no longer throws.** `assert(Tools.writeSource(...))` would cancel the whole recording — including scripts already restored earlier in this same loop — the first time one script's write failed. Capture `okW, wErr` and record a skip instead, so one hard failure reports itself without undoing the restores that already worked.
+- **The trash lookup matches the full original path, not just the leaf name.** `it:GetAttribute("RSP_OrigName") == ch.path:match("([^.]+)$")` plus the plan id could match the wrong trashed instance whenever two instances trashed by the same plan share a leaf name (e.g. two different `Door` parts under different parents). `Store.trash` records `RSP_OrigParent` as the parent's full name and `RSP_OrigName` as the leaf; their join is exactly the `ch.path` captured before the move, so matching on `parent .. "." .. name == ch.path` (plus the plan id) is unambiguous.
+- **Every `changed` entry is now accounted for.** The `if ch.kind == "script" … elseif ch.created … elseif (ch.trashed or ch.origParent) …` chain had no final `else`, so an entry matching none of those conditions (e.g. a `created` instance that can no longer be found, so `ch.created and inst` is false) silently vanished from both `report.restored` and `report.skipped`. The added `else` arm reports it as skipped instead.
+- **The trash-on-revert call no longer throws either.** `Store.trash(inst, id .. "-revert")` calls `Store.trash`, which `error()`s when `Store.ensure()` fails (store version mismatch, mid-cycle). Left unguarded, that throw cancels the whole revert recording, undoing every restore already applied earlier in this same loop — the identical failure shape as the old-source-write fix above. `pcall` it and report a skip on failure instead.
+- **Revert now unwinds a repair's own edits too, first.** Task 10 introduced `Goal.verify.repair.changed` (a REPAIRING pass's own `changed[]`, with its own `before/k` chunks — see Task 10 Step 2/3). Without this, reverting a plan that went through a repair silently left the repair's edits in place — the same dishonesty class as F1-F3 above, just for a set of changes Revert didn't know existed. The per-change restore/skip logic (`if ch.kind == "script" … elseif ch.created … elseif (ch.trashed or ch.origParent) … else …`) is now factored into a local `revertChange(ch)` so both walks share it rather than duplicating the chain, and the repair's `changed[]` (newest writes) is walked first, then the plan's steps, newest-to-oldest throughout.
 
 - [ ] **Step 4: Result card, Plans view, Trash view (section 11)**
 
 ```lua
 local function showResultCard(rec)
+	local old = goalScroll:FindFirstChild("ResultCard"); if old then old:Destroy() end
 	local f = card(("%s · %s"):format(rec.id, rec.status)); f.Name = "ResultCard"
 	local done, total = 0, 0
 	for _, st in ipairs(rec.steps or {}) do total += 1; if st.status == "done" then done += 1 end end
@@ -3026,11 +3233,11 @@ local function showResultCard(rec)
 		end
 	end)
 	button("View record", bar, UDim2.new(0, 90, 1, 0), UDim2.new(0, 182, 0, 0), function()
-		GoalUI.prompt("record", { title = rec.id, text = rec.summary .. "\n\n" .. HttpService:JSONEncode(rec) })
+		GoalUI.view(rec.id, rec.summary .. "\n\n" .. HttpService:JSONEncode(rec))
 	end)
 end
 
-local function showPlansView(offset)
+showPlansView = function(offset)
 	for _, c in ipairs(goalScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
 	local page, total = Store.listPlans(offset)
 	local f = card(("Plans %d–%d of %d"):format(offset + 1, offset + #page, total)); f.Name = "PlansView"
@@ -3039,7 +3246,7 @@ local function showPlansView(offset)
 		mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -150, 1, 0), Position = UDim2.new(0, 6, 0, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("%s · %s · %s"):format(p.id, p.status, p.goal) }, row)
 		button("Open", row, UDim2.new(0, 44, 0, 18), UDim2.new(1, -140, 0, 2), function()
 			local rec = Store.readPlan(p.id)
-			GoalUI.prompt("record", { title = p.id, text = rec and (rec.summary .. "\n\n" .. HttpService:JSONEncode(rec)) or "unreadable record" })
+			GoalUI.view(p.id, rec and (rec.summary .. "\n\n" .. HttpService:JSONEncode(rec)) or "unreadable record")
 		end)
 		button("Revert", row, UDim2.new(0, 50, 0, 18), UDim2.new(1, -90, 0, 2), function()
 			if GoalUI.prompt("confirm", { title = "Revert " .. p.id .. "?", text = "See result card note." }) == "allow" then
@@ -3054,7 +3261,7 @@ local function showPlansView(offset)
 	button("Back", bar, UDim2.new(0, 60, 1, 0), UDim2.new(1, -60, 0, 0), function() f:Destroy() end)
 end
 
-local function showTrashView()
+showTrashView = function()
 	for _, c in ipairs(goalScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
 	local items = Store.trashItems()
 	local f = card(("Trash (%d)"):format(#items)); f.Name = "TrashView"
@@ -3093,7 +3300,7 @@ GoalUI.refreshPlans = function()
 	if trashButton then trashButton.Text = ("Trash (%d)"):format(#Store.trashItems()) end
 end
 ```
-Extend `GoalUI.showCard` with `elseif kind == "result" then showResultCard(data)`. In `buildGoalView`, add two buttons to the button row: `plansButton = button("Plans", row, UDim2.new(0, 70, 1, 0), UDim2.new(1, -150, 0, 0), function() showPlansView(0) end)` and `trashButton = button("Trash", row, UDim2.new(0, 70, 1, 0), UDim2.new(1, -74, 0, 0), showTrashView)`; shrink `phaseLabel` to `Size = UDim2.new(1, -320, 1, 0)`. Declare `plansButton, trashButton` with the other section-11 locals. In BOOTSTRAP, after `buildUI(w)`, connect `ChangeHistoryService.OnUndo:Connect(GoalUI.refreshPlans)` and `ChangeHistoryService.OnRedo:Connect(GoalUI.refreshPlans)` and call `GoalUI.refreshPlans()` once.
+Extend `GoalUI.showCard` with `elseif kind == "result" then showResultCard(data)`. In `buildGoalView`, add two buttons to the button row: `plansButton = button("Plans", row, UDim2.new(0, 70, 1, 0), UDim2.new(1, -150, 0, 0), function() showPlansView(0) end)` and `trashButton = button("Trash", row, UDim2.new(0, 70, 1, 0), UDim2.new(1, -74, 0, 0), showTrashView)`; shrink `phaseLabel` to `Size = UDim2.new(1, -320, 1, 0)`. Declare `plansButton, trashButton` with the other section-11 locals. Also forward-declare `local showPlansView, showTrashView` with those same section-11 locals (next to `chipButtons`/`FOCUS_IDS` from Task 6): `buildGoalView`'s button row above calls `showPlansView(0)` and passes `showTrashView` as a handler before either name is assigned below, so without this forward declaration those closures would resolve to nil globals the first time Plans/Trash is clicked. The definitions below are plain `showPlansView = function(offset) … end` and `showTrashView = function() … end` assignments to this same upvalue — not `local function` — for exactly that reason. In BOOTSTRAP, after `buildUI(w)`, connect `ChangeHistoryService.OnUndo:Connect(GoalUI.refreshPlans)` and `ChangeHistoryService.OnRedo:Connect(GoalUI.refreshPlans)` and call `GoalUI.refreshPlans()` once.
 
 - [ ] **Step 5: Reload and verify**
 
@@ -3166,7 +3373,6 @@ local function captureFromHistoryTable(hist, boundaryTs)
 			if chars + #msg <= OUTPUT_MAX_CHARS then table.insert(errors, 1, msg); chars += #msg end
 		elseif e.messageType == Enum.MessageType.MessageWarning then
 			warnings += 1
-			if chars + #msg <= OUTPUT_MAX_CHARS then table.insert(errors, 1, "[warn] " .. msg); chars += #msg end
 		elseif #output < 60 then
 			table.insert(output, 1, utf8Trim(msg, 200))
 		end
@@ -3215,6 +3421,10 @@ end
 -- second = true for the confirm run after a repair pass.
 local function armVerify(second)
 	local myGen = Goal.gen
+	-- Make the single-live-verify invariant self-evident: never leave a prior arm's
+	-- connections dangling if something re-arms without going through a finalize/skip path.
+	if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
+	if Goal.verifyHb then Goal.verifyHb:Disconnect(); Goal.verifyHb = nil end
 	Goal.verify = Goal.verify or { enabled = true, ran = false, errors = {}, preexisting = {}, warnings = 0, output = {} }
 	local live = {}
 	local hist = LogService:GetLogHistory()
@@ -3240,8 +3450,10 @@ local function armVerify(second)
 			Goal.verifyConn:Disconnect(); Goal.verifyConn = nil
 			-- Primary = MessageOut; fallback = history diff (S2). Merge: history fills output lines and covers a MessageOut miss.
 			local hErrors, hWarnings, hOutput, overflowed = captureFromHistory(boundary)
+			-- Errors only: warnings are counted (hWarnings, below) but never fed to
+			-- attributeErrors — a mere warning must never trigger a repair.
 			local errors = {}
-			for _, l in ipairs(live) do table.insert(errors, (l.messageType == Enum.MessageType.MessageWarning and "[warn] " or "") .. l.message) end
+			for _, l in ipairs(live) do if l.messageType == Enum.MessageType.MessageError then table.insert(errors, l.message) end end
 			if #errors == 0 then errors = hErrors end
 			local v = Goal.verify
 			v.ran, v.overflowed, v.output = true, overflowed, hOutput
@@ -3296,19 +3508,27 @@ function Agent.repair()
 			return true
 		end)
 		Goal.estTokens += ps.used.tokens
+		local bookkeeping = Goal.steps[0]
+		Goal.steps[0] = nil -- a repair is never a plan step; never let it leak into steps[]
 		if not Agent.checkGen(myGen) then return end
-		v.repair.changed, v.repair.undoLabels = Goal.steps[0].changed, Goal.steps[0].undoLabels
-		Goal.steps[0] = nil
+		v.repair.changed, v.repair.undoLabels = bookkeeping.changed, bookkeeping.undoLabels
+		v.repair.beforeSources = bookkeeping.beforeSources
 		if not ok then v.repair.outcome = "repair failed: " .. tostring(why) end
-		-- Executor labels batches "Step 0"; relabel the recording names for repair
-		for i, l in ipairs(v.repair.undoLabels) do v.repair.undoLabels[i] = l:gsub("Step 0", "Repair") end
+		-- Executor already labels a step.n == 0 batch "Repair" (see runWriteBatch), so
+		-- undoLabels read "RoScript Pro: Repair, part k" directly; no relabel needed here.
 		Goal.phase = "VERIFYING"
 		GoalUI.setPhase("VERIFYING", "press Run again to confirm, then Stop")
 		armVerify(true)
 	end)
 end
 ```
-In `Executor.runWriteBatch` the label builder uses `step.n`; add `local label = step.n == 0 and "Repair" or ("Step %d"):format(step.n)` so repair recordings read `RoScript Pro: Repair, part k` directly (then drop the `gsub` relabel above).
+In `Executor.runWriteBatch` the label builder uses `step.n`; add `local label = step.n == 0 and "Repair" or ("Step %d"):format(step.n)` so repair recordings read `RoScript Pro: Repair, part k` directly (no relabel needed — the sample above no longer carries the `gsub` post-process it once did, since that batch label already reads "Repair" at the source).
+
+Fix round 1 (four Important findings plus two minors, all applied above and mirrored here):
+- **F1+F2 — warnings no longer fold into `errors`.** `captureFromHistoryTable` kept inserting a `"[warn] " .. msg` line into the `errors` list for every `MessageWarning`, so (a) the self-test's own `#errs == 1` assertion after adding one error + one warning would have failed (`errors` held 2 entries), and (b) a mere warning whose text happened to name a changed script could reach `attributeErrors` and trigger a repair. `warnings` stays a count; only `MessageError` entries ever populate `errors`. The live `MessageOut` merge in `armVerify` is fixed the same way — it now filters `live` down to `MessageError` entries only before building `errors`, so `attributeErrors` never sees a warning line from either path. Folded in: `chars += #msg` in the error branch already counts the string actually inserted (`msg`, unprefixed) — the mismatch only existed in the warning branch this removes.
+- **F3 — a Stop mid-REPAIRING can no longer leave a phantom `n = 0` step in the record.** `Goal.steps[0] = nil` now runs unconditionally right after the repair's tool loop returns, before the `Agent.checkGen` guard, so a stopped repair still clears its scratch bookkeeping. Belt and braces: `Agent.record`'s step-collection loop (defined in Task 9, Step 2 — mirrored there: `for n, b in pairs(Goal.steps) do ... end`) now skips `n == 0` explicitly, so even if something else ever left a stray index-0 entry, it could not reach a written record.
+- **F4 — Revert now unwinds a repair's own edits, not just the plan's steps.** Three coordinated pieces, two of them landing in functions this task doesn't define: `Agent.repair` (this task) stashes `bookkeeping.beforeSources` into `v.repair.beforeSources` (mirrors what the steps loop already had); `Agent.record`'s `beforeSources` flatten pass (defined in Task 9 — mirrored there, Step 2) runs a second loop, after the steps (so the repair's chunks get the highest global `before/k` indices), over `record.verify.repair.changed`, then strips the transient `rp.beforeSources` map before the record is persisted; `Agent.revertPlan` (also Task 9, Step 3 — mirrored there) walks `rec.verify.repair.changed` first (newest writes unwind first), then the steps as before, and factors the shared per-change restore/skip logic into a `revertChange(ch)` local so neither walk duplicates it.
+- **Minor — `armVerify` disconnects any pre-existing `Goal.verifyConn`/`Goal.verifyHb` before assigning new ones**, so the single-live-verify invariant holds even if something re-arms without going through a finalize/skip path first.
 
 - [ ] **Step 4: Verify card (section 11)**
 
