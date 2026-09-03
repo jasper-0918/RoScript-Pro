@@ -2195,6 +2195,327 @@ end)
 
 -- ═══════════════════════ 9. TOOLS ═══════════════════════
 
+local Tools = { read = {}, write = {} }
+local Refs = {} -- "#rN" -> Instance
+local RefOf = setmetatable({}, { __mode = "k" }) -- Instance -> "#rN"
+local refCounter = 0
+local WHITELIST
+do
+	function Tools.clearRefs()
+		Refs = {}
+		RefOf = setmetatable({}, { __mode = "k" })
+		refCounter = 0
+	end
+
+	function Tools.ref(inst)
+		local r = RefOf[inst]
+		if r then return r end
+		refCounter += 1
+		r = "#r" .. refCounter
+		Refs[r] = inst
+		RefOf[inst] = r
+		return r
+	end
+
+	function Tools.resolve(target)
+		if type(target) ~= "string" or #target == 0 then
+			return nil, "empty target"
+		end
+		if target:sub(1, 2) == "#r" then
+			local inst = Refs[target]
+			if inst and inst:IsDescendantOf(game) then
+				return inst
+			end
+			return nil, "ref " .. target .. " is stale and no path was given"
+		end
+		local inst = walkPath(target)
+		if inst then return inst end
+		return nil, "path did not resolve: " .. target
+	end
+
+	function Tools.readSource(script)
+		local ok, src = pcall(function() return ScriptEditorService:GetEditorSource(script) end)
+		if ok and type(src) == "string" then return src end
+		return script.Source
+	end
+	function Tools.hashOf(script)
+		return Store.hash(Tools.readSource(script))
+	end
+
+	function Tools.encodeValue(v)
+		local t = typeof(v)
+		if t == "Vector3" then return { x = v.X, y = v.Y, z = v.Z }
+		elseif t == "Color3" then return { r = math.floor(v.R * 255 + 0.5), g = math.floor(v.G * 255 + 0.5), b = math.floor(v.B * 255 + 0.5) }
+		elseif t == "UDim" then return { s = v.Scale, o = v.Offset }
+		elseif t == "UDim2" then return { xs = v.X.Scale, xo = v.X.Offset, ys = v.Y.Scale, yo = v.Y.Offset }
+		elseif t == "Vector2" then return { x = v.X, y = v.Y }
+		elseif t == "EnumItem" then return v.Name
+		elseif t == "Instance" then return v:GetFullName()
+		elseif t == "string" or t == "number" or t == "boolean" or t == "nil" then return v
+		end
+		return { typeof = t, value = tostring(v) } -- read-only fallback; never fails inspect
+	end
+
+	-- expected: "string"|"number"|"boolean"|"Vector3"|"Color3"|"UDim"|"UDim2"|"Vector2"|<EnumName>|"Instance"
+	function Tools.decodeValue(str, expected)
+		local ok, v = pcall(function() return HttpService:JSONDecode(str) end)
+		if not ok then return nil, "value is not JSON: " .. tostring(str):sub(1, 60) end
+		if expected == "string" or expected == "number" or expected == "boolean" then
+			if type(v) ~= expected then return nil, "expected " .. expected end
+			return v
+		elseif expected == "Vector3" then
+			if type(v) ~= "table" then return nil, "expected {x,y,z}" end
+			return Vector3.new(tonumber(v.x) or 0, tonumber(v.y) or 0, tonumber(v.z) or 0)
+		elseif expected == "Vector2" then
+			if type(v) ~= "table" then return nil, "expected {x,y}" end
+			return Vector2.new(tonumber(v.x) or 0, tonumber(v.y) or 0)
+		elseif expected == "Color3" then
+			if type(v) ~= "table" then return nil, "expected {r,g,b} 0-255" end
+			return Color3.fromRGB(math.clamp(tonumber(v.r) or 0, 0, 255), math.clamp(tonumber(v.g) or 0, 0, 255), math.clamp(tonumber(v.b) or 0, 0, 255))
+		elseif expected == "UDim" then
+			if type(v) ~= "table" then return nil, "expected {s,o}" end
+			return UDim.new(tonumber(v.s) or 0, tonumber(v.o) or 0)
+		elseif expected == "UDim2" then
+			if type(v) ~= "table" then return nil, "expected {xs,xo,ys,yo}" end
+			return UDim2.new(tonumber(v.xs) or 0, tonumber(v.xo) or 0, tonumber(v.ys) or 0, tonumber(v.yo) or 0)
+		elseif expected == "Instance" then
+			local inst = type(v) == "string" and Tools.resolve(v)
+			if not inst then return nil, "instance path did not resolve" end
+			return inst
+		else -- Enum name
+			local e = Enum[expected]
+			if not e then return nil, "unknown type " .. expected end
+			local okE, item = pcall(function() return e[v] end)
+			if not okE or item == nil then return nil, ("%s is not a %s"):format(tostring(v), expected) end
+			return item
+		end
+	end
+
+	-- Spec §5.4. Keyed by class; Tools.propsFor walks IsA so BasePart covers Part/MeshPart/etc.
+	local TEXT = { Text = "string", TextColor3 = "Color3", TextSize = "number", Font = "Font", TextScaled = "boolean", TextWrapped = "boolean", RichText = "boolean" }
+	WHITELIST = {
+		Instance = { Name = "string", Archivable = "boolean" },
+		BasePart = { Anchored = "boolean", CanCollide = "boolean", CanTouch = "boolean", CanQuery = "boolean", Transparency = "number", Reflectance = "number", Color = "Color3", Material = "Material", Size = "Vector3", Position = "Vector3", Orientation = "Vector3", CastShadow = "boolean", Massless = "boolean" },
+		Model = { PrimaryPart = "Instance" },
+		Light = { Brightness = "number", Color = "Color3", Range = "number", Enabled = "boolean", Shadows = "boolean" },
+		Lighting = { Ambient = "Color3", OutdoorAmbient = "Color3", Brightness = "number", ClockTime = "number", FogEnd = "number", FogStart = "number", FogColor = "Color3" },
+		GuiObject = { Visible = "boolean", Position = "UDim2", Size = "UDim2", AnchorPoint = "Vector2", BackgroundColor3 = "Color3", BackgroundTransparency = "number", ZIndex = "number", LayoutOrder = "number" },
+		TextLabel = TEXT, TextButton = TEXT, TextBox = TEXT,
+		ScreenGui = { Enabled = "boolean", ResetOnSpawn = "boolean", DisplayOrder = "number" },
+		UIListLayout = { FillDirection = "FillDirection", HorizontalAlignment = "HorizontalAlignment", VerticalAlignment = "VerticalAlignment", SortOrder = "SortOrder", Padding = "UDim" },
+		UIGridLayout = { FillDirection = "FillDirection", HorizontalAlignment = "HorizontalAlignment", VerticalAlignment = "VerticalAlignment", SortOrder = "SortOrder", CellSize = "UDim2", CellPadding = "UDim2" },
+		UICorner = { CornerRadius = "UDim" },
+		UIPadding = { PaddingTop = "UDim", PaddingBottom = "UDim", PaddingLeft = "UDim", PaddingRight = "UDim" },
+		UIStroke = { Color = "Color3", Thickness = "number", Transparency = "number" },
+		ProximityPrompt = { ActionText = "string", ObjectText = "string", HoldDuration = "number", MaxActivationDistance = "number", Enabled = "boolean" },
+		ClickDetector = { MaxActivationDistance = "number" },
+		Sound = { SoundId = "string", Volume = "number", Looped = "boolean", Playing = "boolean", PlaybackSpeed = "number" },
+		StringValue = { Value = "string" }, NumberValue = { Value = "number" }, IntValue = { Value = "number" }, BoolValue = { Value = "boolean" }, ObjectValue = { Value = "Instance" }, Vector3Value = { Value = "Vector3" }, Color3Value = { Value = "Color3" },
+		BaseScript = { Enabled = "boolean" },
+	}
+	function Tools.propsFor(inst)
+		local out = {}
+		for class, props in pairs(WHITELIST) do
+			if inst:IsA(class) then
+				for k, v in pairs(props) do out[k] = v end
+			end
+		end
+		return out
+	end
+end
+
+do
+	local SKIP_INDEX = { CoreGui = true, Chat = true, TextChatService = true, Terrain = true, Camera = true }
+
+	local function scriptLines(inst)
+		local src = Tools.readSource(inst)
+		local _, n = src:gsub("\n", "")
+		return n + 1, Store.hash(src)
+	end
+
+	function Tools.read.index(args)
+		local root = (args.path == nil or args.path == "game") and game or Tools.resolve(args.path)
+		if not root then return { ok = false, error = "path did not resolve: " .. tostring(args.path) } end
+		local depth = math.clamp(tonumber(args.depth) or 2, 1, 3)
+		local manifest = Store.readManifest()
+		local lines, count, truncated = {}, 0, 0
+		local function walk(inst, d, indent)
+			for _, ch in ipairs(inst:GetChildren()) do
+				if not SKIP_INDEX[ch.ClassName] and not SKIP_INDEX[ch.Name] then
+					if count >= INDEX_MAX_ENTRIES then
+						truncated += 1
+					else
+						count += 1
+						local extra = ""
+						if ch:IsA("LuaSourceContainer") then
+							local n, h = scriptLines(ch)
+							local stored = manifest[ch:GetFullName()]
+							extra = (" | %d lines"):format(n) .. (stored and stored ~= h and " | edited-outside" or "")
+						end
+						local label = (ch.Parent == ServerStorage and ch.Name == "RoScriptPro") and " [RoScript Pro store]" or ""
+						table.insert(lines, ("%s%s | %s | %d children%s%s | %s"):format(indent, ch.Name, ch.ClassName, #ch:GetChildren(), extra, label, Tools.ref(ch)))
+						if d > 1 and label == "" then walk(ch, d - 1, indent .. "  ") end
+					end
+				end
+			end
+		end
+		walk(root, depth, "")
+		local text = table.concat(lines, "\n")
+		if truncated > 0 then text ..= ("\n…%d more, narrow the path"):format(truncated) end
+		return { ok = true, text = text, count = count, truncated = truncated }
+	end
+
+	function Tools.read.inspect(args)
+		local inst, err = Tools.resolve(args.target)
+		if not inst then return { ok = false, error = err } end
+		local props = {}
+		for name in pairs(Tools.propsFor(inst)) do
+			local okP, v = pcall(function() return inst[name] end)
+			if okP then props[name] = Tools.encodeValue(v) end
+		end
+		props.ClassName = inst.ClassName
+		props.Parent = inst.Parent and inst.Parent:GetFullName() or nil
+		local attrs = {}
+		for k, v in pairs(inst:GetAttributes()) do attrs[k] = Tools.encodeValue(v) end
+		local children = {}
+		for i, ch in ipairs(inst:GetChildren()) do
+			if i > 20 then table.insert(children, ("…%d more"):format(#inst:GetChildren() - 20)); break end
+			table.insert(children, ch.Name .. " (" .. ch.ClassName .. ") " .. Tools.ref(ch))
+		end
+		return { ok = true, path = inst:GetFullName(), ref = Tools.ref(inst), props = props, attributes = attrs, tags = inst:GetTags(), children = children }
+	end
+
+	function Tools.read.read_script(args)
+		local inst, err = Tools.resolve(args.target)
+		if not inst then return { ok = false, error = err } end
+		if not inst:IsA("LuaSourceContainer") then return { ok = false, error = "not a script: " .. inst.ClassName } end
+		local src = Tools.readSource(inst)
+		local all = src:split("\n")
+		local from = math.max(1, tonumber(args.fromLine) or 1)
+		local to = math.min(#all, tonumber(args.toLine) or #all)
+		local out, chars = {}, 0
+		for i = from, to do
+			local line = ("%d\t%s"):format(i, all[i])
+			chars += #line + 1
+			if chars > READ_SCRIPT_MAX then
+				table.insert(out, ("… cut at line %d; call again with fromLine=%d"):format(i, i))
+				break
+			end
+			table.insert(out, line)
+		end
+		return { ok = true, path = inst:GetFullName(), ref = Tools.ref(inst), totalLines = #all, hash = Store.hash(src), text = table.concat(out, "\n") }
+	end
+
+	function Tools.read.search(args)
+		local root = (args.root == nil or args.root == "game") and game or Tools.resolve(args.root)
+		if not root then return { ok = false, error = "root did not resolve" } end
+		local needle = tostring(args.text or "")
+		if #needle == 0 then return { ok = false, error = "empty search text" } end
+		local usePattern = args.pattern == true
+		local hits = {}
+		for _, inst in ipairs(root:GetDescendants()) do
+			if inst:IsA("LuaSourceContainer") and not inst:IsDescendantOf(Store.root() or inst) then
+				local path = inst:GetFullName()
+				for i, line in ipairs(Tools.readSource(inst):split("\n")) do
+					local found
+					if usePattern then
+						local okF, res = pcall(string.find, line, needle)
+						if not okF then return { ok = false, error = "malformed Luau pattern: " .. tostring(res) } end
+						found = res ~= nil
+					else
+						found = line:lower():find(needle:lower(), 1, true) ~= nil
+					end
+					if found then
+						table.insert(hits, ("%s:%d: %s"):format(path, i, utf8Trim(line, 160)))
+						if #hits >= SEARCH_MAX_HITS then
+							return { ok = true, hits = hits, truncated = true }
+						end
+					end
+				end
+			end
+		end
+		return { ok = true, hits = hits, truncated = false }
+	end
+
+	function Tools.read.read_output(args)
+		local count = math.clamp(tonumber(args.count) or 40, 1, 200)
+		local hist = LogService:GetLogHistory()
+		local out, chars = {}, 0
+		for i = #hist, 1, -1 do
+			local e = hist[i]
+			if e.messageType == Enum.MessageType.MessageError or e.messageType == Enum.MessageType.MessageWarning then
+				local line = ("[%s] %s"):format(e.messageType.Name:gsub("Message", ""), utf8Trim(tostring(e.message), 200))
+				chars += #line
+				if chars > OUTPUT_MAX_CHARS or #out >= count then break end
+				table.insert(out, line)
+			end
+		end
+		return { ok = true, lines = out, ringSize = #hist }
+	end
+
+	function Tools.read.read_memory(args)
+		local facts, notes = Store.readMemory()
+		return { ok = true, facts = facts, notes = notes }
+	end
+	function Tools.read.list_plans(args)
+		local page, total = Store.listPlans(tonumber(args.offset) or 0)
+		return { ok = true, plans = page, total = total }
+	end
+	function Tools.read.read_plan(args)
+		local rec, err = Store.readPlan(tostring(args.id or ""))
+		if not rec then return { ok = false, error = err } end
+		return { ok = true, record = rec }
+	end
+end
+
+SelfTest.case("tools: refs are unique and resolve", function()
+	withScratch(function(f)
+		local a = Instance.new("Part"); a.Name = "Part"; a.Parent = f
+		local b = Instance.new("Part"); b.Name = "Part"; b.Parent = f
+		local ra, rb = Tools.ref(a), Tools.ref(b)
+		assert(ra ~= rb, "distinct refs for same-named siblings")
+		assert(Tools.ref(a) == ra, "stable")
+		assert(Tools.resolve(ra) == a and Tools.resolve(rb) == b, "resolve by ref")
+		assert(Tools.resolve("ServerStorage.RSP_TestScratch") == f, "resolve by path")
+		b:Destroy()
+		local inst, err = Tools.resolve(rb)
+		assert(inst == nil and err:find("stale"), "destroyed ref is stale: " .. tostring(err))
+	end)
+end)
+SelfTest.case("tools: value codec", function()
+	local v = Tools.encodeValue(Vector3.new(1, 2, 3))
+	assert(v.x == 1 and v.z == 3, "vector3")
+	local c = Tools.encodeValue(Color3.fromRGB(255, 0, 128))
+	assert(c.r == 255 and c.b == 128, "color3")
+	assert(Tools.encodeValue(Enum.Material.Neon) == "Neon", "enum")
+	assert(Tools.decodeValue('{"x":1,"y":2,"z":3}', "Vector3") == Vector3.new(1, 2, 3), "decode v3")
+	assert(Tools.decodeValue('"Neon"', "Material") == Enum.Material.Neon, "decode enum")
+	assert(Tools.decodeValue("true", "boolean") == true, "decode bool")
+	local _, err = Tools.decodeValue('"Nope"', "Material")
+	assert(err, "bad enum rejected")
+	local _, e2 = Tools.decodeValue("5", "UDim2")
+	assert(e2 and e2:find("expected", 1, true), "non-table for UDim2 rejected, not thrown")
+end)
+SelfTest.case("tools: index caps and labels", function()
+	withScratch(function(f)
+		for i = 1, INDEX_MAX_ENTRIES + 5 do
+			local p = Instance.new("Folder"); p.Name = "F" .. i; p.Parent = f
+		end
+		local r = Tools.read.index({ path = "ServerStorage.RSP_TestScratch", depth = 1 })
+		assert(r.ok and r.truncated == 5, "truncated count " .. tostring(r.truncated))
+		assert(select(2, r.text:gsub("\n", "")) >= INDEX_MAX_ENTRIES - 1, "line count")
+	end)
+end)
+SelfTest.case("tools: search plain vs pattern", function()
+	withScratch(function(f)
+		local s = Instance.new("Script"); s.Name = "S"; s.Source = "local Shop = 1\nlocal x = Shop + 1"; s.Parent = f
+		local r = Tools.read.search({ text = "shop", root = "ServerStorage.RSP_TestScratch", pattern = false })
+		assert(r.ok and #r.hits == 2, "plain ci hits " .. tostring(r.ok and #r.hits))
+		local bad = Tools.read.search({ text = "%", root = "ServerStorage.RSP_TestScratch", pattern = true })
+		assert(bad.ok == false, "malformed pattern is a tool error, not a throw")
+	end)
+end)
+
 -- ═══════════════════════ 10. AGENT ═══════════════════════
 
 -- ═══════════════════════ 11. GOAL UI ═══════════════════════
