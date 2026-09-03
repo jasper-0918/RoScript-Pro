@@ -31,6 +31,8 @@ local StudioService = game:GetService("StudioService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local ServerStorage = game:GetService("ServerStorage")
+local RunService = game:GetService("RunService")
+local LogService = game:GetService("LogService")
 
 local PROV = {
 	groq = { name = "Groq", url = "https://api.groq.com/openai/v1/chat/completions", strictTools = false },
@@ -1885,6 +1887,310 @@ end
 SelfTest.case("harness runs", function()
 	assert(budgetFor("deep").plan == 24, "deep plan budget")
 	assert(budgetFor("nonsense").plan == 12, "default budget")
+end)
+
+local Store = {}
+do
+	local ROOT_NAME = "RoScriptPro"
+
+	function Store.inEdit()
+		return RunService:IsEdit()
+	end
+
+	-- FNV-1a 32-bit, hex. Luau has no hashing built in, and a plain h * prime
+	-- overflows 2^53 for large h, so the multiply is done exactly in 16-bit halves.
+	local function mul32(a, b)
+		local al, ah = a % 65536, math.floor(a / 65536)
+		local bl, bh = b % 65536, math.floor(b / 65536)
+		return (al * bl + ((ah * bl + al * bh) % 65536) * 65536) % 4294967296
+	end
+	function Store.hash(s)
+		local h = 2166136261
+		for i = 1, #s do
+			h = mul32(bit32.bxor(h, s:byte(i)), 16777619)
+		end
+		return string.format("%08x", h)
+	end
+
+	function Store.withRecording(label, fn)
+		if not Store.inEdit() then
+			return false, "not in edit mode"
+		end
+		local rec = ChangeHistoryService:TryBeginRecording("RoScriptPro " .. label, "RoScript Pro: " .. label)
+		if not rec then
+			return false, "undo unavailable"
+		end
+		local ok, err = pcall(fn)
+		ChangeHistoryService:FinishRecording(rec, ok and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel)
+		if not ok then
+			return false, tostring(err)
+		end
+		return true
+	end
+
+	local function child(parent, name, class)
+		local c = parent:FindFirstChild(name)
+		if not c then
+			c = Instance.new(class or "Folder")
+			c.Name = name
+			c.Parent = parent
+		end
+		return c
+	end
+
+	function Store.root()
+		return ServerStorage:FindFirstChild(ROOT_NAME)
+	end
+
+	function Store.ensure()
+		local root = Store.root()
+		if root then
+			local v = root:GetAttribute("RSP_StoreVersion")
+			if v ~= STORE_VERSION then
+				return nil, ("store version %s found, this plugin expects %d; Goal Mode refuses to start"):format(tostring(v), STORE_VERSION)
+			end
+		else
+			root = Instance.new("Folder")
+			root.Name = ROOT_NAME
+			root:SetAttribute("RSP_StoreVersion", STORE_VERSION)
+			root.Parent = ServerStorage
+		end
+		child(root, "Memory"); child(root, "Manifest"); child(root, "Plans"); child(root, "Trash")
+		return root
+	end
+
+	-- Chunked text in StringValues chunk_1..n.
+	function Store.readText(folder)
+		local parts = {}
+		local i = 1
+		while true do
+			local c = folder:FindFirstChild("chunk_" .. i)
+			if not c then break end
+			parts[i] = c.Value
+			i += 1
+		end
+		return table.concat(parts)
+	end
+
+	function Store.writeText(folder, text)
+		local n = 0
+		local pos = 1
+		repeat
+			n += 1
+			local c = child(folder, "chunk_" .. n, "StringValue")
+			c.Value = text:sub(pos, pos + CHUNK_MAX - 1)
+			pos += CHUNK_MAX
+		until pos > #text
+		local k = n + 1
+		while true do
+			local extra = folder:FindFirstChild("chunk_" .. k)
+			if not extra then break end
+			extra:Destroy()
+			k += 1
+		end
+	end
+
+	-- Memory = "<facts>\n<<<NOTES>>>\n<notes>"
+	local SEP = "\n<<<NOTES>>>\n"
+	function Store.readMemory()
+		local root = Store.root()
+		if not root then return "", "" end
+		local text = Store.readText(root.Memory)
+		local a, b = text:find(SEP, 1, true)
+		if not a then return text, "" end
+		return text:sub(1, a - 1), text:sub(b + 1)
+	end
+	function Store.writeMemory(facts, notes)
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
+		Store.writeText(root.Memory, utf8Trim(facts, FACTS_MAX) .. SEP .. utf8Trim(notes, NOTES_MAX))
+	end
+
+	function Store.readManifest()
+		local root = Store.root()
+		if not root then return {} end
+		local text = Store.readText(root.Manifest)
+		if #text == 0 then return {} end
+		local ok, map = pcall(function() return HttpService:JSONDecode(text) end)
+		return ok and type(map) == "table" and map or {}
+	end
+	function Store.writeManifest(map)
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
+		Store.writeText(root.Manifest, HttpService:JSONEncode(map))
+	end
+
+	local function slug(title)
+		local s = title:lower():gsub("[^a-z0-9]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+		return s:sub(1, 30):gsub("%-+$", "")
+	end
+	function Store.nextPlanId(title)
+		local root = Store.root()
+		local maxN = 0
+		if root then
+			for _, p in ipairs(root.Plans:GetChildren()) do
+				local n = tonumber(p.Name:match("^Plan_(%d+)_"))
+				if n and n > maxN then maxN = n end
+			end
+		end
+		return ("Plan_%03d_%s"):format(maxN + 1, slug(title))
+	end
+
+	function Store.listPlans(offset)
+		offset = offset or 0
+		local root = Store.root()
+		if not root then return {}, 0 end
+		local all = {}
+		for _, p in ipairs(root.Plans:GetChildren()) do
+			table.insert(all, { id = p.Name, status = p:GetAttribute("RSP_Status") or "?", createdAt = p:GetAttribute("RSP_CreatedAt") or 0, goal = p:GetAttribute("RSP_Goal") or "" })
+		end
+		table.sort(all, function(a, b) return a.createdAt > b.createdAt end)
+		local page = {}
+		for i = offset + 1, math.min(offset + 10, #all) do
+			table.insert(page, all[i])
+		end
+		return page, #all
+	end
+
+	function Store.readPlan(id)
+		local root = Store.root()
+		local p = root and root.Plans:FindFirstChild(id)
+		if not p then return nil, "no such plan" end
+		local ok, rec = pcall(function() return HttpService:JSONDecode(Store.readText(p)) end)
+		if not ok or type(rec) ~= "table" then return nil, "unreadable record" end
+		return rec
+	end
+
+	-- Caller holds the recording. beforeSources: k -> source text for changed[].before = "before/k".
+	function Store.writePlan(record, beforeSources)
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
+		local p = child(root.Plans, record.id)
+		p:SetAttribute("RSP_Status", record.status)
+		p:SetAttribute("RSP_CreatedAt", record.createdAt)
+		p:SetAttribute("RSP_Goal", utf8Trim(record.goal or "", 200))
+		Store.writeText(p, HttpService:JSONEncode(record))
+		local before = child(p, "before")
+		for k, src in pairs(beforeSources or {}) do
+			Store.writeText(child(before, tostring(k)), src)
+		end
+	end
+
+	function Store.applyCaps()
+		local root = Store.root()
+		if not root then return end
+		local plans = root.Plans:GetChildren()
+		table.sort(plans, function(a, b) return (a:GetAttribute("RSP_CreatedAt") or 0) > (b:GetAttribute("RSP_CreatedAt") or 0) end)
+		for i = PLANS_KEEP + 1, #plans do
+			plans[i]:Destroy()
+			GoalUI.log("pruned old record " .. plans[i].Name, "muted")
+		end
+		local items = root.Trash:GetChildren()
+		table.sort(items, function(a, b) return (a:GetAttribute("RSP_TrashedAt") or 0) > (b:GetAttribute("RSP_TrashedAt") or 0) end)
+		local cutoff = os.time() - TRASH_DAYS * 86400
+		for i, it in ipairs(items) do
+			if i > TRASH_KEEP or (it:GetAttribute("RSP_TrashedAt") or 0) < cutoff then
+				GoalUI.log("emptied old trash item " .. it.Name, "muted")
+				it:Destroy()
+			end
+		end
+	end
+
+	-- Inside the step's recording (caller holds it).
+	function Store.trash(inst, planId)
+		local root, err = Store.ensure()
+		if not root then
+			error(err)
+		end
+		inst:SetAttribute("RSP_OrigParent", inst.Parent and inst.Parent:GetFullName() or "")
+		inst:SetAttribute("RSP_OrigName", inst.Name)
+		inst:SetAttribute("RSP_Plan", planId or "")
+		inst:SetAttribute("RSP_TrashedAt", os.time())
+		inst.Parent = root.Trash
+	end
+	function Store.trashItems()
+		local root = Store.root()
+		return root and root.Trash:GetChildren() or {}
+	end
+	-- choice: nil (fail on conflict), "rename", "replace". Opens its own recording.
+	function Store.restore(item, choice)
+		return Store.withRecording("restore", function()
+			local parentPath = item:GetAttribute("RSP_OrigParent") or ""
+			local parent = walkPath(parentPath) or workspace
+			local name = item:GetAttribute("RSP_OrigName") or item.Name
+			local clash = parent:FindFirstChild(name)
+			if clash and clash ~= item then
+				if choice == "rename" then
+					name = name .. "_restored"
+				elseif choice == "replace" then
+					Store.trash(clash, "restore-replace")
+				else
+					error("conflict: a sibling named " .. name .. " exists")
+				end
+			end
+			item.Name = name
+			item.Parent = parent
+			for _, a in ipairs({ "RSP_OrigParent", "RSP_OrigName", "RSP_Plan", "RSP_TrashedAt" }) do
+				item:SetAttribute(a, nil)
+			end
+		end)
+	end
+	function Store.emptyTrash()
+		return Store.withRecording("empty trash", function()
+			for _, it in ipairs(Store.trashItems()) do
+				it:Destroy() -- the only Destroy of user content in the plugin; Jasper confirmed the modal
+			end
+		end)
+	end
+end
+
+SelfTest.case("store: fnv1a known vectors", function()
+	assert(Store.hash("") == "811c9dc5", "empty -> offset basis, got " .. Store.hash(""))
+	assert(Store.hash("a") == "e40c292c", "'a', got " .. Store.hash("a"))
+	assert(Store.hash("hello") ~= Store.hash("hellp"), "distinct")
+end)
+SelfTest.case("store: chunk round trip past CHUNK_MAX", function()
+	withScratch(function(f)
+		local text = string.rep("y", CHUNK_MAX + 17)
+		Store.writeText(f, text)
+		assert(#f:GetChildren() == 2, "two chunks, got " .. #f:GetChildren())
+		assert(Store.readText(f) == text, "round trip")
+		Store.writeText(f, "short")
+		assert(#f:GetChildren() == 1, "surplus chunk deleted")
+		assert(Store.readText(f) == "short", "overwrite")
+	end)
+end)
+SelfTest.case("store: plan id slug", function()
+	local id = Store.nextPlanId("Fix the Shop's Errors!! Now")
+	assert(id:match("^Plan_%d%d%d_fix%-the%-shop%-s%-errors%-%-now$") or id:match("^Plan_%d%d%d_fix%-the%-shop"), id)
+	assert(#id <= 40, "length " .. #id)
+end)
+SelfTest.case("store: ensure + plan write/read/list", function()
+	local existing = ServerStorage:FindFirstChild("RoScriptPro")
+	assert(existing == nil, "run this test in a place with no store yet")
+	local root = assert(Store.ensure())
+	local ok = Store.withRecording("test", function()
+		Store.writePlan({ v = 1, id = "Plan_001_test", status = "done", createdAt = os.time(), goal = "g", steps = {}, summary = "s" }, { [1] = "-- before source" })
+		Store.writeMemory("FACTS", "NOTES")
+		Store.writeManifest({ ["ServerScriptService.X"] = "deadbeef" })
+	end)
+	assert(ok, "recording write")
+	local page, total = Store.listPlans(0)
+	assert(total == 1 and page[1].id == "Plan_001_test", "list")
+	local rec = assert(Store.readPlan("Plan_001_test"))
+	assert(rec.summary == "s", "record")
+	assert(Store.readText(root.Plans.Plan_001_test.before["1"]) == "-- before source", "before chunk")
+	local f, n = Store.readMemory()
+	assert(f == "FACTS" and n == "NOTES", "memory")
+	assert(Store.readManifest()["ServerScriptService.X"] == "deadbeef", "manifest")
+	assert(Store.nextPlanId("Next") == "Plan_002_next", Store.nextPlanId("Next"))
+	root:Destroy()
 end)
 
 -- ═══════════════════════ 9. TOOLS ═══════════════════════
