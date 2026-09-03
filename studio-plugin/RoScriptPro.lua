@@ -2602,6 +2602,314 @@ SelfTest.case("tools: search plain vs pattern", function()
 	end)
 end)
 
+do
+	function Tools.syntaxCheck(source)
+		local ok, fn, err = pcall(loadstring, source)
+		if not ok then return false, "could not compile: " .. tostring(fn) end
+		if fn then return true end
+		return false, tostring(err)
+	end
+
+	function Tools.lineDiffPercent(a, b)
+		local la, lb = a:split("\n"), b:split("\n")
+		local set = {}
+		for _, l in ipairs(la) do set[l] = (set[l] or 0) + 1 end
+		local same = 0
+		for _, l in ipairs(lb) do
+			if set[l] and set[l] > 0 then same += 1; set[l] -= 1 end
+		end
+		local total = math.max(#la, #lb, 1)
+		return math.floor((1 - same / total) * 100 + 0.5)
+	end
+
+	-- Writes source through UpdateSourceAsync (S1 route: unopened scripts may use .Source instead).
+	-- Returns ok, err. Caller holds the recording and re-checks gen after this returns.
+	local USE_SOURCE_FOR_UNOPENED = false -- flip to true if S1 shows no undo for unopened scripts
+	function Tools.writeSource(script, compute)
+		local isOpen = ScriptEditorService:FindScriptDocument(script) ~= nil
+		if USE_SOURCE_FOR_UNOPENED and not isOpen then
+			local new, cerr = compute(script.Source)
+			if not new then return false, cerr end
+			script.Source = new
+			return true
+		end
+		local computeErr
+		local ok, err = pcall(function()
+			ScriptEditorService:UpdateSourceAsync(script, function(old)
+				local new, e = compute(old)
+				if not new then computeErr = e; return old end -- unchanged
+				return new
+			end)
+		end)
+		if not ok then return false, tostring(err) end
+		if computeErr then return false, computeErr end
+		return true
+	end
+end
+
+-- Each write tool returns a result table and never touches the recording itself (the Executor
+-- owns TryBeginRecording/FinishRecording); ctx.simulated[inst] carries the source as earlier
+-- calls in the same batch left it, so later calls in a batch see earlier edits.
+do
+	local function scriptTarget(target)
+		local inst, err = Tools.resolve(target)
+		if not inst then return nil, err end
+		if not inst:IsA("LuaSourceContainer") then return nil, "not a script: " .. inst.ClassName end
+		return inst
+	end
+	local function protected(inst)
+		local root = Store.root()
+		return (root and (inst == root or inst:IsDescendantOf(root))) or inst:IsDescendantOf(game:GetService("CoreGui"))
+	end
+	local function currentSource(inst, ctx)
+		return (ctx and ctx.simulated and ctx.simulated[inst]) or Tools.readSource(inst)
+	end
+	-- compute(old) -> new | nil, err. It runs INSIDE UpdateSourceAsync's callback so the edit
+	-- lands on the source the editor actually holds at write time, not on a copy read before
+	-- the yield. The syntax gate runs on the computed source inside the callback too; the
+	-- callback must not yield, and loadstring does not. err may be a full result table.
+	local function applySource(inst, compute, ctx, tool, extraOf)
+		if ctx.dryRun then
+			local base = currentSource(inst, ctx)
+			local new, cerr = compute(base)
+			if not new then return type(cerr) == "table" and cerr or { ok = false, error = tostring(cerr) } end
+			local okS, serr = Tools.syntaxCheck(new)
+			if not okS then return { ok = false, error = "syntax error: " .. serr } end
+			ctx.simulated[inst] = new
+			return { ok = true, dry = true, newSource = new }
+		end
+		local landed, extra, failErr
+		local ok, err = Tools.writeSource(inst, function(old)
+			local new, cerr = compute(old)
+			if not new then failErr = cerr; return nil, "compute rejected" end
+			local okS, serr = Tools.syntaxCheck(new)
+			if not okS then failErr = "syntax error: " .. serr; return nil, failErr end
+			landed = new
+			extra = extraOf and extraOf(old, new) or nil
+			return new
+		end)
+		if not ok or not landed then
+			if type(failErr) == "table" then return failErr end
+			return { ok = false, error = failErr or err or "write failed" }
+		end
+		ctx.simulated[inst] = landed
+		local r = { ok = true, path = inst:GetFullName(), ref = Tools.ref(inst), hash = Store.hash(landed), tool = tool }
+		for k, v in pairs(extra or {}) do r[k] = v end
+		return r
+	end
+
+	function Tools.write.replace_lines(args, ctx)
+		local inst, err = scriptTarget(args.target); if not inst then return { ok = false, error = err } end
+		if protected(inst) then return { ok = false, error = "target is protected" } end
+		return applySource(inst, function(old)
+			if Store.hash(old) ~= tostring(args.expectHash) then
+				return nil, { ok = false, error = "expectHash does not match the current source; read_script again" }
+			end
+			local lines = old:split("\n")
+			local from, to = tonumber(args.fromLine), tonumber(args.toLine)
+			if not from or not to or from % 1 ~= 0 or to % 1 ~= 0 or from < 1 or to < from or to > #lines then
+				return nil, { ok = false, error = ("line range must be whole numbers within 1..%d"):format(#lines) }
+			end
+			local out = {}
+			for i = 1, from - 1 do table.insert(out, lines[i]) end
+			for _, l in ipairs(tostring(args.newText or ""):split("\n")) do table.insert(out, l) end
+			for i = to + 1, #lines do table.insert(out, lines[i]) end
+			return table.concat(out, "\n")
+		end, ctx, "replace_lines", function()
+			return { from = tonumber(args.fromLine), to = tonumber(args.toLine), newLines = select(2, tostring(args.newText or ""):gsub("\n", "")) + 1 }
+		end)
+	end
+
+	function Tools.write.edit_script(args, ctx)
+		local inst, err = scriptTarget(args.target); if not inst then return { ok = false, error = err } end
+		if protected(inst) then return { ok = false, error = "target is protected" } end
+		local find, rep = tostring(args.find or ""), tostring(args.replace or "")
+		if #find == 0 then return { ok = false, error = "empty find" } end
+		return applySource(inst, function(old)
+			local first = old:find(find, 1, true)
+			if not first then
+				-- nearest: best single-line match of find's first non-blank line
+				local probe = find:match("([^\n]*%S[^\n]*)") or find
+				local lines = old:split("\n")
+				local bestI = nil
+				for i, l in ipairs(lines) do if l:find(probe, 1, true) then bestI = i; break end end
+				local near = {}
+				if bestI then for i = math.max(1, bestI - 3), math.min(#lines, bestI + 3) do table.insert(near, i .. "\t" .. lines[i]) end end
+				return nil, { ok = false, error = "find not found", nearest = table.concat(near, "\n") }
+			end
+			local second = old:find(find, first + #find, true)
+			if second and not args.all then
+				local count, pos, ln = 0, 1, {}
+				while true do local s = old:find(find, pos, true); if not s then break end; count += 1; table.insert(ln, select(2, old:sub(1, s):gsub("\n", "")) + 1); pos = s + #find end
+				return nil, { ok = false, error = ("find matches %d times; set all=true or make it unique"):format(count), lines = ln }
+			end
+			if args.all then
+				return (old:gsub(find:gsub("%W", "%%%0"), (rep:gsub("%%", "%%%%"))))
+			else
+				return old:sub(1, first - 1) .. rep .. old:sub(first + #find)
+			end
+		end, ctx, "edit_script", function()
+			return { find = utf8Trim(find, 400), replace = utf8Trim(rep, 400) }
+		end)
+	end
+
+	function Tools.write.write_script(args, ctx)
+		local inst, err = scriptTarget(args.target); if not inst then return { ok = false, error = err } end
+		if protected(inst) then return { ok = false, error = "target is protected" } end
+		local new = tostring(args.source or "")
+		return applySource(inst, function(old) return new end, ctx, "write_script", function(old)
+			return { linesChanged = Tools.lineDiffPercent(old, new), newLines = select(2, new:gsub("\n", "")) + 1 }
+		end)
+	end
+
+	local function applyProps(inst, props)
+		local applied, rejected = {}, {}
+		local allowed = Tools.propsFor(inst)
+		for _, pair in ipairs(props or {}) do
+			local name, raw = tostring(pair.name or ""), tostring(pair.value or "")
+			if name:sub(1, 1) == "@" then
+				local okD, v = pcall(function() return HttpService:JSONDecode(raw) end)
+				local t = type(v)
+				if okD and (t == "string" or t == "number" or t == "boolean") then inst:SetAttribute(name:sub(2), v); table.insert(applied, name)
+				else rejected[name] = "attributes accept string, number, boolean JSON values" end
+			elseif allowed[name] then
+				local v, derr = Tools.decodeValue(raw, allowed[name])
+				if v == nil then rejected[name] = derr else
+					local okSet, serr = pcall(function() inst[name] = v end)
+					if okSet then table.insert(applied, name) else rejected[name] = tostring(serr) end
+				end
+			else
+				rejected[name] = "property not whitelisted — write a Script if it must change at runtime"
+			end
+		end
+		return applied, rejected
+	end
+
+	function Tools.write.create(args, ctx)
+		local parent, perr = Tools.resolve(args.parent); if not parent then return { ok = false, error = perr } end
+		if protected(parent) then return { ok = false, error = "parent is protected" } end
+		local okNew, inst = pcall(Instance.new, tostring(args.class))
+		if not okNew then return { ok = false, error = "class not creatable: " .. tostring(args.class) } end
+		inst.Name = tostring(args.name or args.class)
+		if args.source ~= nil and inst:IsA("LuaSourceContainer") then
+			local okS, serr = Tools.syntaxCheck(tostring(args.source))
+			if not okS then inst:Destroy(); return { ok = false, error = "syntax error: " .. serr } end -- never-parented scratch instance; not user content
+			if ctx.dryRun then inst:Destroy(); return { ok = true, dry = true } end
+			inst.Source = tostring(args.source) -- new instance: no editor document yet, .Source is the only route
+		elseif ctx.dryRun then inst:Destroy(); return { ok = true, dry = true } end
+		local applied, rejected = applyProps(inst, args.props)
+		inst.Parent = parent
+		return { ok = true, path = inst:GetFullName(), ref = Tools.ref(inst), created = true, applied = applied, rejected = rejected, tool = "create" }
+	end
+
+	local function eachTarget(args, fn)
+		local targets = args.targets
+		if type(targets) ~= "table" or #targets == 0 or #targets > 50 then return { ok = false, error = "targets must hold 1-50 entries" } end
+		local per, anyOk = {}, false
+		for _, t in ipairs(targets) do
+			local inst, err = Tools.resolve(t)
+			if not inst then per[t] = { ok = false, error = err }
+			elseif protected(inst) then per[t] = { ok = false, error = "protected" }
+			else per[t] = fn(inst); anyOk = anyOk or per[t].ok end
+		end
+		return { ok = anyOk, results = per }
+	end
+
+	function Tools.write.set_props(args, ctx)
+		if ctx.dryRun then return { ok = true, dry = true } end
+		local r = eachTarget(args, function(inst)
+			local applied, rejected = applyProps(inst, args.props)
+			-- §5.2: ok unless nothing applied and something was rejected, so a wholly
+			-- rejected call reads as a failure and the model tries a whitelisted property.
+			return { ok = #applied > 0 or next(rejected) == nil, applied = applied, rejected = rejected, path = inst:GetFullName() }
+		end)
+		-- flatten for the single-target common case
+		if type(args.targets) == "table" and #args.targets == 1 then
+			local only = r.results[args.targets[1]]
+			if only then return only end
+		end
+		return r
+	end
+
+	function Tools.write.move(args, ctx)
+		local newParent, perr = Tools.resolve(args.newParent); if not newParent then return { ok = false, error = perr } end
+		if protected(newParent) then return { ok = false, error = "new parent is protected" } end
+		if ctx.dryRun then return { ok = true, dry = true } end
+		return eachTarget(args, function(inst)
+			local from = inst.Parent and inst.Parent:GetFullName() or ""
+			inst.Parent = newParent
+			return { ok = true, path = inst:GetFullName(), origParent = from, moved = true }
+		end)
+	end
+
+	function Tools.write.trash(args, ctx)
+		if ctx.dryRun then return { ok = true, dry = true } end
+		return eachTarget(args, function(inst)
+			local from = inst.Parent and inst.Parent:GetFullName() or ""
+			local path = inst:GetFullName()
+			Store.trash(inst, ctx.planId) -- moves into the store's Trash folder; never destroys
+			return { ok = true, path = path, origParent = from, trashed = true }
+		end)
+	end
+end
+
+SelfTest.case("tools: syntax gate", function()
+	assert(Tools.syntaxCheck("local x = 1\nprint(x)") == true, "valid")
+	local ok, err = Tools.syntaxCheck("if true then\nprint(1)")
+	assert(ok == false and err and #err > 0, "missing end detected")
+end)
+SelfTest.case("tools: line diff percent", function()
+	local a = "a\nb\nc\nd"
+	assert(Tools.lineDiffPercent(a, a) == 0, "same")
+	assert(Tools.lineDiffPercent(a, "a\nb\nX\nY") == 50, "half, got " .. Tools.lineDiffPercent(a, "a\nb\nX\nY"))
+	assert(Tools.lineDiffPercent(a, "") == 100, "all")
+end)
+SelfTest.case("executor: off-target detection uses ancestors", function()
+	withScratch(function(f)
+		local m = Instance.new("Model"); m.Name = "Lobby"; m.Parent = f
+		local p = Instance.new("Part"); p.Name = "Door"; p.Parent = m
+		local step = { n = 1, targets = { "ServerStorage.RSP_TestScratch.Lobby" } }
+		assert(Executor.isOffTarget(p, step) == false, "descendant of a declared target is on-target")
+		assert(Executor.isOffTarget(f, step) == true, "ancestor of the target is off-target")
+		local step2 = { n = 1, targets = { Tools.ref(p) } }
+		assert(Executor.isOffTarget(p, step2) == false, "ref target")
+	end)
+end)
+SelfTest.case("executor: graceful failure keeps the batch, a throw rolls it back", function()
+	local okRun, err = pcall(function()
+		withScratch(function(f)
+			local s = Instance.new("Script"); s.Name = "S"; s.Source = "print(1)"; s.Parent = f
+			Goal.plan = { steps = { { n = 1, targets = { "ServerStorage.RSP_TestScratch" }, risk = "low" } } }
+			Goal.steps = { { n = 1, changed = {}, writes = {}, undoLabels = {} } }
+			local ps = { phase = "ACTING", step = Goal.plan.steps[1], myGen = Goal.gen, used = { calls = 0, tokens = 0 }, budget = { calls = 99, tokens = 1e9 }, consecutiveErrors = 0 }
+			-- A graceful {ok=false} is reported to the model but does NOT roll the batch back (§8.3).
+			local results, committed = Executor.runWriteBatch({
+				{ index = 1, name = "write_script", args = { target = "ServerStorage.RSP_TestScratch.S", source = "print(2)" } },
+				{ index = 2, name = "set_props", args = { targets = { "ServerStorage.RSP_TestScratch.S" }, props = { { name = "Nope", value = "1" } } } },
+			}, ps)
+			assert(committed == true, "a graceful failure keeps the batch")
+			assert(results[1].ok and s.Source == "print(2)", "script written")
+			assert(results[2].ok == false and results[2].rejected.Nope, "nothing applied means ok=false, with the reason")
+			assert(#Goal.steps[1].changed == 1 and Goal.steps[1].changed[1].hashBefore ~= Goal.steps[1].changed[1].hashAfter, "one script change recorded")
+			assert(#Goal.steps[1].undoLabels == 1, "one recording committed")
+			-- A throw cancels the recording and refuses the rest of the batch (§8.3).
+			Tools.write.__test_throw = function() error("boom") end
+			local r2, c2 = Executor.runWriteBatch({
+				{ index = 1, name = "write_script", args = { target = "ServerStorage.RSP_TestScratch.S", source = "print(3)" } },
+				{ index = 2, name = "__test_throw", args = {} },
+			}, ps)
+			Tools.write.__test_throw = nil
+			assert(c2 == false and s.Source == "print(2)", "the throw rolled the batch back")
+			assert(r2[2].ok == false and r2[2].error:find("write crashed", 1, true), "the throwing call reports its crash")
+			assert(r2[1].ok == false and r2[1].error:find("rolled back", 1, true), "its sibling is marked collateral")
+			assert(#Goal.steps[1].changed == 1 and #Goal.steps[1].undoLabels == 1, "rollback truncated only this batch's bookkeeping")
+		end)
+	end)
+	Tools.write.__test_throw = nil
+	Goal.plan, Goal.steps = nil, {}
+	assert(okRun, err)
+end)
+
 -- ═══════════════════════ 10. AGENT ═══════════════════════
 
 local Agent = {}
@@ -2783,7 +3091,163 @@ local function decodeArgs(call)
 	return args
 end
 
-local Executor = { runWriteBatch = function(writes, ps) local r = {}; for _, w in ipairs(writes) do r[w.index] = { ok = false, error = "write tools not built yet", attributable = false } end; return r, false end }
+local Executor = {}
+do
+	-- Only these three write tools change a script's source text; only they get a
+	-- "before" snapshot and a changed[] entry keyed by source hash. A set_props/move/
+	-- trash call whose target happens to be a script must NOT be mistaken for a source edit.
+	local SOURCE_TOOLS = { write_script = true, edit_script = true, replace_lines = true }
+
+	function Executor.isOffTarget(inst, step)
+		for _, t in ipairs(step.targets or {}) do
+			local declared = Tools.resolve(t)
+			if declared and (inst == declared or inst:IsDescendantOf(declared)) then return false end
+		end
+		return true
+	end
+
+	-- Pre-walk (no writes): simulate sources, decide prompts. Runs entirely before any
+	-- recording opens, so a human decision (GoalUI.prompt, in the caller) never holds one
+	-- open. Returns a list of { write, reason, inst } for calls that need a prompt.
+	local function preWalk(writes, ps, ctx)
+		local prompts = {}
+		local careful = S.get("goal_careful", false) == true
+		for _, w in ipairs(writes) do
+			local reason = nil
+			local target = w.args.target or (type(w.args.targets) == "table" and w.args.targets[1]) or w.args.parent
+			local inst = target and Tools.resolve(target)
+			if inst and Executor.isOffTarget(inst, ps.step) then
+				reason = ("%s targets %s, which the approved step did not declare"):format(w.name, inst:GetFullName())
+			end
+			if w.name == "trash" then
+				for _, t in ipairs(w.args.targets or {}) do
+					local i2 = Tools.resolve(t)
+					if i2 and (#i2:GetDescendants() > 0 or i2:IsA("LuaSourceContainer")) then reason = reason or ("trash %s (%d descendants)"):format(i2:GetFullName(), #i2:GetDescendants()) end
+				end
+			elseif w.name == "write_script" and inst and inst:IsA("LuaSourceContainer") then
+				local old = ctx.simulated[inst] or Tools.readSource(inst)
+				local oldLines = select(2, old:gsub("\n", "")) + 1
+				local pct = Tools.lineDiffPercent(old, tostring(w.args.source or ""))
+				local declaredHigh = ps.step.risk == "high" and not Executor.isOffTarget(inst, ps.step)
+				if oldLines > 200 and pct > 50 and not declaredHigh then reason = reason or ("rewrite %s: %d lines, %d%% changed"):format(inst:GetFullName(), oldLines, pct) end
+			end
+			if careful and not reason then reason = "Careful mode: " .. w.name end
+			-- simulate so later calls in the batch see this one; a dryRun copy of ctx (table.clone
+			-- shares ctx.simulated by reference but flips dryRun) guarantees no real write lands here
+			if inst and (w.name == "write_script" or w.name == "edit_script" or w.name == "replace_lines") then
+				local dry = table.clone(ctx); dry.dryRun = true
+				local r = Tools.write[w.name](w.args, dry)
+				if r.ok and r.newSource then ctx.simulated[inst] = r.newSource end
+			end
+			if reason then table.insert(prompts, { write = w, reason = reason, inst = inst }) end
+		end
+		return prompts
+	end
+
+	local function describe(w)
+		local a = table.clone(w.args)
+		if a.source then a.source = utf8Trim(a.source, 3000) end
+		if a.newText then a.newText = utf8Trim(a.newText, 3000) end
+		if a.find then a.find = utf8Trim(a.find, 3000) end
+		if a.replace then a.replace = utf8Trim(a.replace, 3000) end
+		return HttpService:JSONEncode(a)
+	end
+
+	-- The one recording-gated write path. Prompts are collected and answered BEFORE
+	-- TryBeginRecording, so a human decision never holds a recording open. The whole
+	-- batch runs under a single recording: if any write fails, the recording is
+	-- cancelled (Studio reverts everything it did) and the batch does not commit.
+	function Executor.runWriteBatch(writes, ps)
+		local results = {}
+		local function refuseAll(msg, attributable)
+			for _, w in ipairs(writes) do results[w.index] = { ok = false, error = msg, attributable = attributable } end
+			return results, false
+		end
+		if RunService:IsRunning() then return refuseAll("writes refused while a playtest is running", false) end
+		local step = ps.step
+		local ctx = { planId = Goal.planId, step = step, simulated = {} }
+		local skip = {}
+		for _, p in ipairs(preWalk(writes, ps, ctx)) do
+			local answer = GoalUI.prompt("write", { title = p.reason, text = describe(p.write) })
+			if not Agent.checkGen(ps.myGen) then return refuseAll("stopped", false) end
+			if answer == "stop" then Agent.stop(); return refuseAll("stopped by Jasper", false)
+			elseif answer == "skip" then skip[p.write.index] = true end
+		end
+		ctx.simulated = {} -- discard the pre-walk simulation; the real run recomputes as writes commit
+		local base = (step.n == 0) and "Repair" or ("Step %d"):format(step.n)
+		local label = base .. (ps.batches and ps.batches > 0 and (", part " .. (ps.batches + 1)) or "")
+		local rec = ChangeHistoryService:TryBeginRecording("RoScriptPro " .. label, "RoScript Pro: " .. label)
+		if not rec then return refuseAll("undo unavailable, writes refused", false) end -- no recording => no write
+		Goal.openRecording = { id = rec, owner = coroutine.running() }
+		ps.batches = (ps.batches or 0) + 1
+		local bookkeeping = Goal.steps[step.n]
+		bookkeeping.beforeSources = bookkeeping.beforeSources or {}
+		local changedAt, writesAt = #bookkeeping.changed, #bookkeeping.writes -- this batch's start, for a scoped rollback
+		local committed = true
+		local failedAt = nil
+		for _, w in ipairs(writes) do
+			if skip[w.index] then
+				results[w.index] = { ok = false, error = "skipped by Jasper", attributable = false }
+			else
+				local target = w.args.target or (type(w.args.targets) == "table" and w.args.targets[1])
+				local inst = target and Tools.resolve(target)
+				local isSourceWrite = SOURCE_TOOLS[w.name] and inst and inst:IsA("LuaSourceContainer")
+				local before = isSourceWrite and Tools.readSource(inst) or nil
+				local okCall, r = pcall(Tools.write[w.name], w.args, ctx)
+				if not okCall then r = { ok = false, error = "write crashed: " .. tostring(r) }; failedAt = w.index end
+				-- UpdateSourceAsync (inside the pcall above) is the one bounded yield allowed
+				-- inside this recording; re-check gen the moment it returns.
+				if not Agent.checkGen(ps.myGen) then
+					-- we opened this recording, so only we may finish it (never called twice on one id)
+					ChangeHistoryService:FinishRecording(rec, Enum.FinishRecordingOperation.Cancel)
+					Goal.openRecording = nil
+					return refuseAll("stopped", false)
+				end
+				results[w.index] = r
+				-- §8.3: only a throw (pcall failure, above) rolls the batch back. A graceful
+				-- {ok=false} — a stale hash, an ambiguous find, nothing whitelisted applied —
+				-- is reported to the model and the batch still commits; that outcome is meant
+				-- to be read and retried, not to void sibling writes that already succeeded.
+				if r.ok and isSourceWrite and before then
+					local k = #bookkeeping.changed + 1
+					bookkeeping.beforeSources[k] = before
+					table.insert(bookkeeping.changed, { path = r.path or inst:GetFullName(), ref = Tools.ref(inst), kind = "script", hashBefore = Store.hash(before), hashAfter = r.hash or Tools.hashOf(inst), before = "before/" .. k })
+				elseif r.ok and (r.created or r.moved or r.trashed or r.results or r.applied) then
+					local entries = r.results or { [r.path or "?"] = r }
+					for _, e in pairs(entries) do
+						if e.ok then table.insert(bookkeeping.changed, { path = e.path, ref = e.ref, kind = "instance", origParent = e.origParent, created = e.created, trashed = e.trashed }) end
+					end
+				end
+				if r.ok then
+					local wr = { tool = w.name }
+					for _, k in ipairs({ "from", "to", "newLines", "find", "replace", "linesChanged", "path" }) do wr[k] = r[k] end
+					table.insert(bookkeeping.writes, wr)
+				end
+				if failedAt then break end
+			end
+		end
+		if failedAt then
+			ChangeHistoryService:FinishRecording(rec, Enum.FinishRecordingOperation.Cancel)
+			committed = false
+			for _, w in ipairs(writes) do
+				if w.index ~= failedAt and not skip[w.index] then results[w.index] = { ok = false, error = "batch rolled back", attributable = false } end
+			end
+			-- undo only THIS batch's bookkeeping; a step can span several batches and an
+			-- earlier committed batch's entries must survive a later batch's rollback
+			for k = #bookkeeping.changed, changedAt + 1, -1 do
+				bookkeeping.beforeSources[k] = nil
+				table.remove(bookkeeping.changed, k)
+			end
+			for k = #bookkeeping.writes, writesAt + 1, -1 do table.remove(bookkeeping.writes, k) end
+		else
+			ChangeHistoryService:FinishRecording(rec, Enum.FinishRecordingOperation.Commit)
+			table.insert(bookkeeping.undoLabels, "RoScript Pro: " .. label)
+			GoalUI.log(("%s: %d write%s"):format(label, #writes, #writes == 1 and "" or "s"), "ok")
+		end
+		Goal.openRecording = nil
+		return results, committed
+	end
+end
 
 -- Returns results (one per call, in order) and the control call {name, args} if the batch committed.
 local function runToolBatch(calls, ps)
