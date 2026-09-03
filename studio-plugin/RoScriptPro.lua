@@ -3514,7 +3514,9 @@ function Agent.record(status)
 		if not Agent.checkGen(myGen) then return end
 		local steps = {}
 		for n, b in pairs(Goal.steps) do
-			steps[#steps + 1] = { n = n, status = b.status, outcome = b.outcome, changed = b.changed, writes = b.writes, undoLabels = b.undoLabels }
+			if n ~= 0 then -- belt and braces: a repair's step 0 bookkeeping must never reach the record (see Agent.repair)
+				steps[#steps + 1] = { n = n, status = b.status, outcome = b.outcome, changed = b.changed, writes = b.writes, undoLabels = b.undoLabels }
+			end
 		end
 		table.sort(steps, function(x, y) return x.n < y.n end)
 		local record = {
@@ -3569,6 +3571,20 @@ function Agent.record(status)
 				end
 			end
 		end
+		-- A repair's own edits get the same before/k treatment, over the SAME global k,
+		-- placed AFTER the steps so they take the highest indices — Revert unwinds the
+		-- repair first (newest writes), then the steps, so this ordering matches that walk.
+		local rp = record.verify and record.verify.repair
+		if rp and rp.changed then
+			for _, ch in ipairs(rp.changed) do
+				if ch.before then
+					k += 1
+					beforeSources[k] = (rp.beforeSources and rp.beforeSources[tonumber(ch.before:match("before/(%d+)"))]) or ""
+					ch.before = "before/" .. k
+				end
+			end
+			rp.beforeSources = nil -- raw source belongs in before/ chunks, never in the record JSON
+		end
 		local ok, err = Store.withRecording("record", function()
 			Store.writeMemory(facts, newNotes)
 			Store.writeManifest(buildManifest())
@@ -3597,47 +3613,59 @@ function Agent.revertPlan(id)
 	local report = { restored = {}, skipped = {} }
 	local root = Store.root()
 	local folder = root and root.Plans:FindFirstChild(id)
-	local ok, werr = Store.withRecording("revert " .. id, function()
-		for i = #rec.steps, 1, -1 do
-			local st = rec.steps[i]
-			for j = #(st.changed or {}), 1, -1 do
-				local ch = st.changed[j]
-				local inst = walkPath(ch.path)
-				if ch.kind == "script" and ch.before then
-					local beforeFolder = folder and folder:FindFirstChild("before") and folder.before:FindFirstChild(ch.before:match("before/(.+)"))
-					if inst and inst:IsA("LuaSourceContainer") and beforeFolder then
-						if Tools.hashOf(inst) == ch.hashAfter then
-							local src = Store.readText(beforeFolder)
-							local okW, wErr = Tools.writeSource(inst, function() return src end)
-							if okW then
-								table.insert(report.restored, ch.path)
-							else
-								table.insert(report.skipped, ch.path .. " (write failed: " .. tostring(wErr) .. ")")
-							end
-						else
-							table.insert(report.skipped, ch.path .. " (edited since)")
-						end
+	-- Shared by both the repair walk and the steps walk below, so the restore/skip logic
+	-- for one changed[] entry exists in exactly one place.
+	local function revertChange(ch)
+		local inst = walkPath(ch.path)
+		if ch.kind == "script" and ch.before then
+			local beforeFolder = folder and folder:FindFirstChild("before") and folder.before:FindFirstChild(ch.before:match("before/(.+)"))
+			if inst and inst:IsA("LuaSourceContainer") and beforeFolder then
+				if Tools.hashOf(inst) == ch.hashAfter then
+					local src = Store.readText(beforeFolder)
+					local okW, wErr = Tools.writeSource(inst, function() return src end)
+					if okW then
+						table.insert(report.restored, ch.path)
 					else
-						table.insert(report.skipped, ch.path .. " (missing)")
+						table.insert(report.skipped, ch.path .. " (write failed: " .. tostring(wErr) .. ")")
 					end
-				elseif ch.created and inst then
-					Store.trash(inst, id .. "-revert"); table.insert(report.restored, ch.path .. " (trashed)")
-				elseif (ch.trashed or ch.origParent) then
-					local item = nil
-					for _, it in ipairs(Store.trashItems()) do
-						local parent, name = it:GetAttribute("RSP_OrigParent"), it:GetAttribute("RSP_OrigName")
-						if it:GetAttribute("RSP_Plan") == id and parent and name and (parent .. "." .. name) == ch.path then
-							item = it
-							break
-						end
-					end
-					local target = item or inst
-					local parent = ch.origParent and walkPath(ch.origParent)
-					if target and parent then target.Parent = parent; table.insert(report.restored, ch.path) else table.insert(report.skipped, ch.path .. " (origin missing)") end
 				else
-					table.insert(report.skipped, tostring(ch.path) .. " (no longer present)")
+					table.insert(report.skipped, ch.path .. " (edited since)")
+				end
+			else
+				table.insert(report.skipped, ch.path .. " (missing)")
+			end
+		elseif ch.created and inst then
+			local okT, tErr = pcall(Store.trash, inst, id .. "-revert")
+			if okT then
+				table.insert(report.restored, ch.path .. " (trashed)")
+			else
+				table.insert(report.skipped, ch.path .. " (could not trash: " .. tostring(tErr) .. ")")
+			end
+		elseif (ch.trashed or ch.origParent) then
+			local item = nil
+			for _, it in ipairs(Store.trashItems()) do
+				local parent, name = it:GetAttribute("RSP_OrigParent"), it:GetAttribute("RSP_OrigName")
+				if it:GetAttribute("RSP_Plan") == id and parent and name and (parent .. "." .. name) == ch.path then
+					item = it
+					break
 				end
 			end
+			local target = item or inst
+			local parent = ch.origParent and walkPath(ch.origParent)
+			if target and parent then target.Parent = parent; table.insert(report.restored, ch.path) else table.insert(report.skipped, ch.path .. " (origin missing)") end
+		else
+			table.insert(report.skipped, tostring(ch.path) .. " (no longer present)")
+		end
+	end
+	local ok, werr = Store.withRecording("revert " .. id, function()
+		-- Repair's edits are the newest writes, so they unwind first, then the steps.
+		local rp = rec.verify and rec.verify.repair
+		if rp and rp.changed then
+			for j = #rp.changed, 1, -1 do revertChange(rp.changed[j]) end
+		end
+		for i = #rec.steps, 1, -1 do
+			local st = rec.steps[i]
+			for j = #(st.changed or {}), 1, -1 do revertChange(st.changed[j]) end
 		end
 	end)
 	if not ok then return false, { error = werr } end
@@ -3737,6 +3765,7 @@ function Agent.stop()
 		-- the owning batch coroutine cancels at its next gen check (§8.3); nothing to do here
 	end
 	if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
+	if Goal.verifyHb then Goal.verifyHb:Disconnect(); Goal.verifyHb = nil end
 	GoalUI.setBusy(false)
 	if Goal.phase == "ACTING" or Goal.phase == "REPAIRING" then
 		for _, b in pairs(Goal.steps) do
@@ -3904,6 +3933,163 @@ function Agent.afterActing()
 	end
 end
 
+-- Pure: works on any history-shaped table so it can be tested without a run.
+local function captureFromHistoryTable(hist, boundaryTs)
+	local errors, output, warnings, chars = {}, {}, 0, 0
+	local sawOlder = false
+	for i = #hist, 1, -1 do
+		local e = hist[i]
+		if (e.timestamp or 0) < boundaryTs - 1 then sawOlder = true; break end
+		local msg = tostring(e.message)
+		if e.messageType == Enum.MessageType.MessageError then
+			if chars + #msg <= OUTPUT_MAX_CHARS then table.insert(errors, 1, msg); chars += #msg end
+		elseif e.messageType == Enum.MessageType.MessageWarning then
+			warnings += 1
+		elseif #output < 60 then
+			table.insert(output, 1, utf8Trim(msg, 200))
+		end
+	end
+	local overflowed = (#hist >= 512) and not sawOlder
+	return errors, warnings, output, overflowed
+end
+local function captureFromHistory(boundaryTs)
+	return captureFromHistoryTable(LogService:GetLogHistory(), boundaryTs)
+end
+
+local function attributeErrors(errors, changedPaths)
+	local trig, pre = {}, {}
+	for _, e in ipairs(errors) do
+		local hit = false
+		for path in pairs(changedPaths) do
+			if e:find(path, 1, true) then hit = true; break end
+		end
+		table.insert(hit and trig or pre, e)
+	end
+	return trig, pre
+end
+
+local function changedPathSet()
+	local set = {}
+	for _, b in pairs(Goal.steps) do
+		for _, ch in ipairs(b.changed or {}) do if ch.kind == "script" then set[ch.path] = true end end
+	end
+	return set
+end
+
+function Agent.skipVerify()
+	if Goal.phase ~= "VERIFYING" then return end
+	if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
+	if Goal.verifyHb then Goal.verifyHb:Disconnect(); Goal.verifyHb = nil end
+	Goal.verify = Goal.verify or { enabled = true }
+	Goal.verify.ran = false
+	Goal.phase = "RECORDING"
+	Agent.record(deriveStatus(Goal.steps))
+end
+
+-- second = true for the confirm run after a repair pass.
+local function armVerify(second)
+	local myGen = Goal.gen
+	-- Make the single-live-verify invariant self-evident: never leave a prior arm's
+	-- connections dangling if something re-arms without going through a finalize/skip path.
+	if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
+	if Goal.verifyHb then Goal.verifyHb:Disconnect(); Goal.verifyHb = nil end
+	Goal.verify = Goal.verify or { enabled = true, ran = false, errors = {}, preexisting = {}, warnings = 0, output = {} }
+	local live = {}
+	local hist = LogService:GetLogHistory()
+	local boundary = #hist > 0 and (hist[#hist].timestamp or os.time()) or os.time()
+	Goal.verifyConn = LogService.MessageOut:Connect(function(msg, mtype)
+		if mtype == Enum.MessageType.MessageError or mtype == Enum.MessageType.MessageWarning then
+			table.insert(live, { message = msg, messageType = mtype, timestamp = os.time() })
+			GoalUI.setPhase("VERIFYING", ("%d error/warning lines so far"):format(#live))
+		end
+	end)
+	GoalUI.showCard("verify", { second = second })
+	local wasRunning, started = false, os.clock()
+	Goal.verifyHb = RunService.Heartbeat:Connect(function()
+		if not Agent.checkGen(myGen) then
+			Goal.verifyHb:Disconnect(); Goal.verifyHb = nil
+			if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
+			return
+		end
+		if RunService:IsRunning() then
+			wasRunning = true
+		elseif wasRunning and RunService:IsEdit() then
+			Goal.verifyHb:Disconnect(); Goal.verifyHb = nil
+			Goal.verifyConn:Disconnect(); Goal.verifyConn = nil
+			-- Primary = MessageOut; fallback = history diff (S2). Merge: history fills output lines and covers a MessageOut miss.
+			local hErrors, hWarnings, hOutput, overflowed = captureFromHistory(boundary)
+			-- Errors only: warnings are counted (hWarnings, below) but never fed to
+			-- attributeErrors — a mere warning must never trigger a repair.
+			local errors = {}
+			for _, l in ipairs(live) do if l.messageType == Enum.MessageType.MessageError then table.insert(errors, l.message) end end
+			if #errors == 0 then errors = hErrors end
+			local v = Goal.verify
+			v.ran, v.overflowed, v.output = true, overflowed, hOutput
+			local trig, pre = attributeErrors(errors, changedPathSet())
+			if second then
+				v.repair = v.repair or {}
+				v.repair.errorsAfter = trig
+				v.repair.ran = true
+				Goal.phase = "RECORDING"
+				Agent.record(deriveStatus(Goal.steps))
+				return
+			end
+			v.errors, v.preexisting, v.warnings = trig, pre, hWarnings
+			if overflowed then
+				GoalUI.log("capture truncated (512-entry ring), result inconclusive; no repair", "error")
+				Goal.phase = "RECORDING"; Agent.record(deriveStatus(Goal.steps)); return
+			end
+			if #trig > 0 then
+				Agent.repair()
+			else
+				GoalUI.log(("verify: 0 errors on changed scripts%s"):format(#pre > 0 and (", " .. #pre .. " pre-existing") or ""), "ok")
+				Goal.phase = "RECORDING"; Agent.record(deriveStatus(Goal.steps))
+			end
+		end
+	end)
+end
+
+function Agent.startVerify()
+	Goal.phase = "VERIFYING"
+	GoalUI.setPhase("VERIFYING", "press Run (F8), then Stop")
+	armVerify(false)
+end
+
+function Agent.repair()
+	Goal.phase = "REPAIRING"
+	GoalUI.setPhase("REPAIRING", "fixing errors on changed scripts")
+	local myGen = Goal.gen
+	task.spawn(function()
+		local b = budgetFor(S.get("goal_effort", "normal"))
+		local v = Goal.verify
+		v.repair = { ran = true, outcome = nil, changed = {}, undoLabels = {}, errorsAfter = {} }
+		local changed = {}
+		for path in pairs(changedPathSet()) do table.insert(changed, path) end
+		local step = { n = 0, title = "Repair", action = "edit", targets = changed, detail = "fix only what these errors point at; do not extend the plan", risk = "medium", included = true }
+		Goal.steps[0] = { n = 0, changed = {}, writes = {}, undoLabels = {} }
+		local seed = ("=== ERRORS ON CHANGED SCRIPTS ===\n%s\n\n=== VERIFY HINT ===\n%s\n\n=== CHANGED SCRIPTS ===\n%s\n\n=== PHASE ===\nFix only what these errors point at; do not extend the plan. Read the failing lines first. Call finish_step when done."):format(table.concat(v.errors, "\n"), Goal.plan.verify_hint or "", table.concat(changed, "\n"))
+		local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = stepSeed(step) .. "\n\n" .. seed } } }
+		local ps = newPhaseState("REPAIRING", b.repair)
+		ps.step = step
+		local ok, why = runPhaseLoop(convo, ps, Schemas.forPhase("REPAIRING"), "finish_step", function(args)
+			v.repair.outcome = utf8Trim(tostring(args.outcome or ""), 400)
+			return true
+		end)
+		Goal.estTokens += ps.used.tokens
+		local bookkeeping = Goal.steps[0]
+		Goal.steps[0] = nil -- a repair is never a plan step; never let it leak into steps[]
+		if not Agent.checkGen(myGen) then return end
+		v.repair.changed, v.repair.undoLabels = bookkeeping.changed, bookkeeping.undoLabels
+		v.repair.beforeSources = bookkeeping.beforeSources
+		if not ok then v.repair.outcome = "repair failed: " .. tostring(why) end
+		-- Executor already labels a step.n == 0 batch "Repair" (see runWriteBatch), so
+		-- undoLabels read "RoScript Pro: Repair, part k" directly; no relabel needed here.
+		Goal.phase = "VERIFYING"
+		GoalUI.setPhase("VERIFYING", "press Run again to confirm, then Stop")
+		armVerify(true)
+	end)
+end
+
 SelfTest.case("agent: schemas obey strict rules", function()
 	local json = HttpService:JSONEncode(Schemas.forPhase("PLANNING"))
 	assert(not json:find('"properties":[]', 1, true), "no empty properties arrays")
@@ -4006,6 +4192,24 @@ SelfTest.case("record: revert restores untouched scripts and skips edited ones",
 		assert(a.Source == "print('before A')" and b.Source:find("hand edit", 1, true), "A reverted, B skipped")
 		root.Plans["Plan_900_revert-test"]:Destroy()
 	end)
+end)
+SelfTest.case("verify: history capture honours the boundary and the ring", function()
+	local fake = {}
+	for i = 1, 600 do fake[i] = { message = "old " .. i, messageType = Enum.MessageType.MessageOutput, timestamp = 1000 + i } end
+	local errs, warns, out, overflowed = captureFromHistoryTable(fake, 1700)
+	assert(#errs == 0 and overflowed == false, "nothing after boundary")
+	table.insert(fake, { message = "ServerScriptService.Shop:12: attempt to index nil", messageType = Enum.MessageType.MessageError, timestamp = 1700 })
+	table.insert(fake, { message = "careful", messageType = Enum.MessageType.MessageWarning, timestamp = 1701 })
+	errs, warns, out, overflowed = captureFromHistoryTable(fake, 1700)
+	assert(#errs == 1 and warns == 1, ("errors %d warnings %d"):format(#errs, warns))
+	local ring = {}
+	for i = 1, 512 do ring[i] = { message = "e" .. i, messageType = Enum.MessageType.MessageError, timestamp = 2000 + i } end
+	local _, _, _, ov = captureFromHistoryTable(ring, 1999)
+	assert(ov == true, "all 512 entries newer than the boundary means overflow")
+end)
+SelfTest.case("verify: error attribution by changed script path", function()
+	local trig, pre = attributeErrors({ "ServerScriptService.Shop:12: attempt to index nil", "Workspace.Old.Script:3: boom", "Stack Begin" }, { ["ServerScriptService.Shop"] = true })
+	assert(#trig == 1 and #pre == 2, ("trig %d pre %d"):format(#trig, #pre))
 end)
 
 -- ═══════════════════════ 11. GOAL UI ═══════════════════════
@@ -4201,6 +4405,21 @@ local function showFailureCard(step)
 	button("Stop", bar, UDim2.new(0, 60, 1, 0), UDim2.new(0, 232, 0, 0), function() f:Destroy(); Agent.stop() end)
 end
 
+local function showVerifyCard(second)
+	local old = goalScroll:FindFirstChild("VerifyCard"); if old then old:Destroy() end
+	local f = card(second and "Confirm run" or "Verify"); f.Name = "VerifyCard"
+	label(f, second and "Press Run (F8) again, let it run a few seconds, then Stop. The plugin records what changed after the repair." or "Press Run (F8), let it run a few seconds, then Stop. The plugin captures errors while it runs and never starts or stops the playtest itself.", C.TEXT, 1)
+	label(f, "A Run executes every server Script against live services (DataStore, HTTP) exactly as any playtest does.", C.MUTED, 2)
+	local status = label(f, "waiting for Run…", C.MUTED, 3); status.Name = "Status"
+	local t0 = os.clock()
+	local hb; hb = RunService.Heartbeat:Connect(function()
+		if not f.Parent then hb:Disconnect(); return end
+		if RunService:IsRunning() then status.Text = ("running · %ds"):format(math.floor(os.clock() - t0)) end
+	end)
+	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 4 }, f)
+	button("Skip", bar, UDim2.new(0, 60, 1, 0), UDim2.new(0, 0, 0, 0), function() f:Destroy(); Agent.skipVerify() end)
+end
+
 local function showResultCard(rec)
 	local old = goalScroll:FindFirstChild("ResultCard"); if old then old:Destroy() end
 	local f = card(("%s · %s"):format(rec.id, rec.status)); f.Name = "ResultCard"
@@ -4293,6 +4512,7 @@ end
 GoalUI.showCard = function(kind, data)
 	if kind == "plan" then showPlanCard(data)
 	elseif kind == "failure" then showFailureCard(data.step)
+	elseif kind == "verify" then showVerifyCard(data.second)
 	elseif kind == "result" then showResultCard(data) end
 end
 
@@ -4461,6 +4681,7 @@ plugin.Unloading:Connect(function()
 	gen += 1
 	Goal.gen += 1
 	if Goal.verifyConn then Goal.verifyConn:Disconnect() end
+	if Goal.verifyHb then Goal.verifyHb:Disconnect() end
 	if Goal.openRecording then
 		pcall(function() ChangeHistoryService:FinishRecording(Goal.openRecording.id, Enum.FinishRecordingOperation.Cancel) end)
 	end
