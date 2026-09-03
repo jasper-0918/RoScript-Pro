@@ -8,6 +8,10 @@
   Spec: docs/superpowers/specs/2026-09-02-roscript-studio-plugin-design.md
   Spec v2: docs/superpowers/specs/2026-09-03-roscript-goal-mode-design.md
 
+  Goal Mode: toggle Chat|Goal in the top bar to switch docks; the store lives at
+  ServerStorage.RoScriptPro (Memory, Manifest, Plans, Trash); verification is
+  driven by the Studio Run button — the plugin never starts or stops a playtest.
+
   INSTALL (from the repo root, PowerShell):
     Copy-Item "studio-plugin\RoScriptPro.lua" "$env:LOCALAPPDATA\Roblox\Plugins\"
   then restart Studio once. If that folder doesn't exist, paste this file into a
@@ -1886,6 +1890,40 @@ renderSettings = function()
 			renderSettings()
 		end)
 	end
+
+	-- Goal Mode group. `scroll` has no absolute Y-position system to offset from —
+	-- it's a ScrollingFrame with AutomaticCanvasSize driven by a UIListLayout keyed
+	-- off LayoutOrder, and every row above (provider keys, skill packs) claims its
+	-- slot from nextOrder(). GOAL_Y is that same slot, taken live from the panel's
+	-- real layout rather than a pixel offset under a fixed-height frame: it anchors
+	-- this group right after Skill packs and before Clear conversation. The two
+	-- rows below it call nextOrder() again rather than adding to GOAL_Y by hand —
+	-- nextOrder() mutates the shared `order` counter every row after it (Clear
+	-- conversation, the disclaimer label) also reads from, so a hardcoded GOAL_Y+1/
+	-- +2 here would leave that counter behind and collide their LayoutOrder with
+	-- these rows'. Only three keys are exposed here — goal_mode and goal_focus are
+	-- live UI state owned by the top-bar toggle and the chips, not settings.
+	sectionLabel("Goal Mode")
+	local GOAL_Y = nextOrder()
+	local function toggleRow(y, text, key, default)
+		local b = mk("TextButton", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = y, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, Text = "", AutoButtonColor = false }, scroll)
+		mk("UICorner", { CornerRadius = UDim.new(0, 4) }, b)
+		local function paint() b.Text = ("  %s: %s"):format(text, S.get(key, default) and "ON" or "OFF") end
+		paint()
+		b.MouseButton1Click:Connect(function() S.set(key, not S.get(key, default)); paint() end)
+		b.MouseEnter:Connect(function() b.BackgroundColor3 = C.ACCENT end)
+		b.MouseLeave:Connect(function() b.BackgroundColor3 = C.PANEL2 end)
+		return b
+	end
+	toggleRow(GOAL_Y, "Verify after acting (Run button)", "goal_verify_enabled", true)
+	toggleRow(nextOrder(), "Careful: every write prompts", "goal_careful", false)
+	local effort = mk("TextButton", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = nextOrder(), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, Text = "", AutoButtonColor = false }, scroll)
+	mk("UICorner", { CornerRadius = UDim.new(0, 4) }, effort)
+	local function paintEffort() effort.Text = "  Effort: " .. S.get("goal_effort", "normal") .. " (normal = 12/8/6 calls, deep = double)" end
+	paintEffort()
+	effort.MouseButton1Click:Connect(function() S.set("goal_effort", S.get("goal_effort", "normal") == "normal" and "deep" or "normal"); paintEffort() end)
+	effort.MouseEnter:Connect(function() effort.BackgroundColor3 = C.ACCENT end)
+	effort.MouseLeave:Connect(function() effort.BackgroundColor3 = C.PANEL2 end)
 
 	local clearBtn = mk("TextButton", {
 		BackgroundColor3 = C.PANEL,
