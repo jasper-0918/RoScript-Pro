@@ -76,9 +76,10 @@ local CTX_MAX = 11000
 
 local LABEL_MAX = 16000 -- chars per TextLabel; longer runs are split
 
--- Run engine: "module" (ModuleScript + require) or "loadstring".
--- Spike 2 decides; loadstring preferred if both pass (no DataModel churn).
-local RUN_ENGINE = "module"
+-- Run engine: "loadstring" or "module" (ModuleScript + require fallback).
+-- Spike 2 ran 2026-09-03 on this machine: BOTH passed; loadstring ships per
+-- the spec tie-break (no DataModel churn, no module cache).
+local RUN_ENGINE = "loadstring"
 
 local COOLDOWN_DEFAULT = 30 -- seconds, when no Retry-After is readable
 local COOLDOWN_NETFAIL = 15
