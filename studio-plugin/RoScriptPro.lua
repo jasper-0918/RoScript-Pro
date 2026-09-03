@@ -603,17 +603,19 @@ local function isAvailable(entry)
 	return true
 end
 
-local function buildQueue()
+local function buildQueue(goalOnly)
 	local queue = {}
 	local keysByProvider = {}
 	for _, p in ipairs(PROV_ORDER) do
 		keysByProvider[p] = KeyStore.load(p)
 	end
 	for _, link in ipairs(MODEL_CHAIN) do
-		for idx, key in ipairs(keysByProvider[link.p] or {}) do
-			local entry = { p = link.p, m = link.m, key = key, idx = idx }
-			if isAvailable(entry) then
-				table.insert(queue, entry)
+		if not goalOnly or link.tools == true then
+			for idx, key in ipairs(keysByProvider[link.p] or {}) do
+				local entry = { p = link.p, m = link.m, key = key, idx = idx }
+				if isAvailable(entry) then
+					table.insert(queue, entry)
+				end
 			end
 		end
 	end
@@ -635,7 +637,7 @@ end
 local PAT_RATELIMIT = { "rate.?limit", "quota", "too many" }
 local PAT_AUTH = { "invalid.api.key", "unauthorized", "invalid_api_key", "authentication" }
 local PAT_MODELDEAD = { "model_not_found", "no endpoints", "does not exist", "not found", "unavailable", "invalid model" }
-local PAT_TOOLARGE = { "request too large", "context_length", "maximum context", "too many tokens", "reduce the length" }
+local PAT_TOOLARGE = { "request too large", "body is too large", "context_length", "maximum context", "too many tokens", "reduce the length" }
 local PAT_PERMISSION = { "not allowed", "permission", "denied" }
 local PAT_REFUSAL = { "i can'?t", "i cannot", "i'm sorry", "i am unable", "cannot assist" }
 
@@ -662,7 +664,7 @@ local function retryAfterSeconds(headers, bodyText)
 end
 
 -- Classifies a failed attempt, mutating cooldown/bad/per-send state.
--- Returns reason (short text) and action: "next" | "retry-stripped".
+-- Returns reason (short text) and action: "next" | "retry-stripped" | "retry-same".
 local function classifyFailure(entry, code, bodyText, headers, pcallErr, state)
 	local id = keyId(entry)
 	local pname = PROV[entry.p].name
@@ -675,6 +677,16 @@ local function classifyFailure(entry, code, bodyText, headers, pcallErr, state)
 		return pname .. ": " .. utf8Trim(tostring(pcallErr), 80), "next"
 	end
 
+	-- Too-large FIRST, by status code: Groq's 413 body also says rate_limit_exceeded (spec §6.5, A3).
+	if code == 413 or (code == 400 and matchAny(bodyText, PAT_TOOLARGE)) then
+		state.failedProviders[entry.p] = true
+		state.lastCode = code
+		return pname .. ": request too large", "next"
+	end
+	if code == 400 and matchAny(bodyText, PAT_BADTOOLCALL) then
+		state.lastCode = code
+		return pname .. ": model produced a malformed tool call, retrying", "retry-same"
+	end
 	if code == 429 or matchAny(bodyText, PAT_RATELIMIT) then
 		Cooling[id] = os.clock() + (retryAfterSeconds(headers, bodyText) or COOLDOWN_DEFAULT)
 		return pname .. " key #" .. entry.idx .. " cooling", "next"
@@ -691,16 +703,13 @@ local function classifyFailure(entry, code, bodyText, headers, pcallErr, state)
 		state.failedModels[entry.p .. ":" .. entry.m] = true
 		return pname .. "/" .. entry.m .. " unavailable", "next"
 	end
-	if code == 400 and matchAny(bodyText, PAT_TOOLARGE) then
-		state.failedProviders[entry.p] = true
-		return pname .. ": request too large", "next"
-	end
 	return pname .. " HTTP " .. tostring(code), "next"
 end
 
--- One request. Returns table {text, truncated} on success, or
--- nil, code, bodyText, headers, pcallErr on failure.
-local function callProvider(entry, messages)
+-- One request. Returns table {text, toolCalls, reasoning, usage, truncated, entry}
+-- on success, or nil, code, bodyText, headers, pcallErr on failure.
+local function callProvider(entry, messages, opts)
+	opts = opts or {}
 	local headers = {
 		["Content-Type"] = "application/json",
 		["Authorization"] = "Bearer " .. entry.key,
@@ -712,10 +721,27 @@ local function callProvider(entry, messages)
 	local body = {
 		model = entry.m,
 		messages = messages,
-		max_tokens = MAXTOK[entry.p],
-		temperature = 0.5,
+		max_tokens = opts.maxTokens or MAXTOK[entry.p],
+		temperature = opts.temperature or 0.5,
 	}
-	if entry.m:find("gpt%-oss") and not EffortStripped[entry.p] then
+	if opts.goal then body.max_tokens = GOAL_MAXTOK[entry.p] end
+	if opts.tools then
+		local tools = opts.tools
+		if PROV[entry.p].strictTools then
+			tools = table.clone(tools)
+			for i, t in ipairs(tools) do
+				local f = table.clone(t["function"]); f.strict = true
+				tools[i] = { type = "function", ["function"] = f }
+			end
+		end
+		body.tools = tools
+		if entry.p == "openrouter" then
+			body.provider = { require_parameters = true } -- minimal body: nothing else optional below
+		elseif not (entry.m:find("gpt%-oss") and entry.p == "groq") then
+			body.parallel_tool_calls = true -- gpt-oss on Groq has no parallel tool use (A1)
+		end
+	end
+	if entry.m:find("gpt%-oss") and not EffortStripped[entry.p] and not (opts.tools and entry.p == "openrouter") then
 		body.reasoning_effort = "low"
 	end
 	local okEnc, encoded = pcall(function()
@@ -763,12 +789,17 @@ local function callProvider(entry, messages)
 		return nil, codeGuess, msg, resp.Headers, nil
 	end
 
-	local text = choice.message.content
-	if type(text) ~= "string" or text:gsub("%s", "") == "" then
+	local msg = choice.message
+	local text = msg.content
+	local calls = msg.tool_calls
+	if (type(text) ~= "string" or text:gsub("%s", "") == "") and not (type(calls) == "table" and #calls > 0) then
 		return nil, resp.StatusCode, "empty content", resp.Headers, nil
 	end
 	return {
-		text = text,
+		text = (type(text) == "string" and text ~= "") and text or nil,
+		toolCalls = (type(calls) == "table" and #calls > 0) and calls or nil,
+		reasoning = (type(msg.reasoning) == "string" and msg.reasoning ~= "") and msg.reasoning or nil,
+		usage = decoded.usage,
 		truncated = (choice.finish_reason == "length"),
 		entry = entry,
 	}
@@ -778,9 +809,10 @@ end
 -- failedModels/failedProviders sets. statusFn is a caller-provided closure
 -- that internally checks the generation counter, so an orphaned (stopped)
 -- walk can never write stale status to the UI.
-local function chatOnce(messages, state, statusFn)
+local function chatOnce(messages, state, statusFn, opts)
 	statusFn = statusFn or function() end
-	local queue = buildQueue()
+	opts = opts or {}
+	local queue = buildQueue(opts.goal == true)
 	if #queue == 0 then
 		if KeyStore.count() == 0 then
 			return nil, "Add a free Groq/OpenRouter/Cerebras key in Settings (gear button)."
@@ -788,15 +820,21 @@ local function chatOnce(messages, state, statusFn)
 		return nil, "All keys are cooling down or invalid. Wait a moment and Retry."
 	end
 	local lastReason = nil
+	local sizeSkipped = 0
 	local i = 1
 	while i <= #queue do
 		local entry = queue[i]
-		local skip = state.failedModels[entry.p .. ":" .. entry.m]
+		local otherSkip = state.failedModels[entry.p .. ":" .. entry.m]
 			or state.failedProviders[entry.p]
 			or not isAvailable(entry)
+		local sizeSkip = opts.estTokens and entry.p == "groq" and opts.estTokens > GROQ_REQ_MAX
+		local skip = otherSkip or sizeSkip
+		if sizeSkip and not otherSkip then
+			sizeSkipped += 1
+		end
 		if not skip then
 			statusFn("Thinking — " .. PROV[entry.p].name .. " " .. entry.m)
-			local result, code, bodyText, respHeaders, pcallErr = callProvider(entry, messages)
+			local result, code, bodyText, respHeaders, pcallErr = callProvider(entry, messages, opts)
 			if result then
 				return result
 			end
@@ -806,16 +844,25 @@ local function chatOnce(messages, state, statusFn)
 			if action == "retry-stripped" then
 				-- Same entry, one immediate retry with reasoning_effort stripped
 				-- (EffortStripped[p] is already set, so callProvider omits it).
-				local retryResult, c2, b2, h2, e2 = callProvider(entry, messages)
+				local retryResult, c2, b2, h2, e2 = callProvider(entry, messages, opts)
 				if retryResult then
 					return retryResult
 				end
 				-- Classify the retry's own failure too, or a 429 here would
 				-- never cool the key and it gets hammered by later entries.
 				lastReason = classifyFailure(entry, c2, b2, h2, e2, state)
+			elseif action == "retry-same" and not state.retriedSame then
+				state.retriedSame = true
+				local retryOpts = table.clone(opts); retryOpts.temperature = 0
+				local r2, c2, b2, h2, e2 = callProvider(entry, messages, retryOpts)
+				if r2 then return r2 end
+				lastReason = classifyFailure(entry, c2, b2, h2, e2, state)
 			end
 		end
 		i += 1
+	end
+	if sizeSkipped > 0 and sizeSkipped == #queue then
+		return nil, ("Request is ~%d tokens; Groq's 8K limit excludes it and no Cerebras or OpenRouter key is available. Add one in Settings or narrow the goal."):format(opts.estTokens)
 	end
 	return nil, (lastReason or "every key failed") .. " — chain exhausted. Retry when keys cool down."
 end
@@ -1887,6 +1934,28 @@ end
 SelfTest.case("harness runs", function()
 	assert(budgetFor("deep").plan == 24, "deep plan budget")
 	assert(budgetFor("nonsense").plan == 12, "default budget")
+end)
+SelfTest.case("provider: 413 classifies as too-large before rate-limit", function()
+	Cooling["groq:1"] = nil
+	local state = { failedModels = {}, failedProviders = {} }
+	local entry = { p = "groq", m = "openai/gpt-oss-120b", key = "k", idx = 1 }
+	local reason, action = classifyFailure(entry, 413, '{"error":{"message":"Request too large for model ... on tokens per minute (TPM): Limit 8000, Requested 12000","code":"rate_limit_exceeded"}}', {}, nil, state)
+	assert(action == "next" and state.failedProviders.groq == true, "413 must mark provider too-large, got " .. tostring(reason))
+	assert(Cooling["groq:1"] == nil, "413 must not cool the key")
+end)
+SelfTest.case("provider: tool_use_failed asks for a same-entry retry", function()
+	local state = { failedModels = {}, failedProviders = {} }
+	local entry = { p = "groq", m = "openai/gpt-oss-120b", key = "k", idx = 2 }
+	local _, action = classifyFailure(entry, 400, '{"error":{"code":"tool_use_failed","failed_generation":"{bad json"}}', {}, nil, state)
+	assert(action == "retry-same", "got " .. tostring(action))
+end)
+SelfTest.case("provider: goal queue filters tool-less entries", function()
+	local q = buildQueue(true)
+	for _, e in ipairs(q) do
+		local link
+		for _, l in ipairs(MODEL_CHAIN) do if l.p == e.p and l.m == e.m then link = l end end
+		assert(link and link.tools == true, "tool-less entry in goal queue: " .. e.m)
+	end
 end)
 
 local Store = {}
