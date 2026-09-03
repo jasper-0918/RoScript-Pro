@@ -3452,8 +3452,197 @@ local function runPhaseLoop(convo, ps, tools, controlName, onControl)
 	end
 end
 
--- Task 9 replaces this stub.
-function Agent.record(status) Goal.phase = "IDLE"; GoalUI.setBusy(false); GoalUI.setPhase("IDLE", tostring(status)) end
+local function buildFacts()
+	local lines = { "Top-level services and child counts:" }
+	for _, svc in ipairs({ "Workspace", "ReplicatedStorage", "ServerScriptService", "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer", "Lighting", "SoundService" }) do
+		local okS, s = pcall(game.GetService, game, svc)
+		if okS and s then table.insert(lines, ("- %s: %d children"):format(svc, #s:GetChildren())) end
+	end
+	local manifest = Store.readManifest()
+	local seen, edited = {}, {}
+	for _, p in ipairs((Store.root() and Store.root().Plans:GetChildren()) or {}) do
+		local rec = Store.readPlan(p.Name)
+		for _, st in ipairs(rec and rec.steps or {}) do
+			for _, ch in ipairs(st.changed or {}) do if ch.kind == "script" then seen[ch.path] = ch.hashAfter end end
+		end
+	end
+	table.insert(lines, "Scripts changed by past plans (path: hash now):")
+	for path, h in pairs(seen) do
+		local inst = walkPath(path)
+		local now = inst and inst:IsA("LuaSourceContainer") and Tools.hashOf(inst) or "missing"
+		table.insert(lines, ("- %s: %s%s"):format(path, now, (manifest[path] and manifest[path] ~= now) and " (edited outside Goal Mode)" or ""))
+	end
+	for path, h in pairs(manifest) do
+		local inst = walkPath(path)
+		if inst and inst:IsA("LuaSourceContainer") and Tools.hashOf(inst) ~= h and not seen[path] then table.insert(edited, path) end
+	end
+	if #edited > 0 then table.insert(lines, "Scripts edited by hand since the last record: " .. table.concat(edited, ", ")) end
+	table.insert(lines, ("Trash items: %d"):format(#Store.trashItems()))
+	local page = Store.listPlans(0)
+	local ids = {}
+	for i = 1, math.min(3, #page) do table.insert(ids, page[i].id .. " (" .. page[i].status .. ")") end
+	table.insert(lines, "Recent plans: " .. (#ids > 0 and table.concat(ids, ", ") or "none"))
+	return utf8Trim(table.concat(lines, "\n"), FACTS_MAX)
+end
+
+local function deriveStatus(steps)
+	local anyDone, anyBad = false, false
+	for _, b in pairs(steps) do
+		if b.status == "done" then anyDone = true end
+		if b.status == "failed" or b.status == "stopped" then anyBad = true end
+	end
+	if not anyBad then return "done" end
+	return anyDone and "partial" or "failed"
+end
+
+local function buildManifest()
+	local map = {}
+	for _, inst in ipairs(game:GetDescendants()) do
+		if inst:IsA("LuaSourceContainer") and not (Store.root() and inst:IsDescendantOf(Store.root())) then
+			map[inst:GetFullName()] = Tools.hashOf(inst)
+		end
+	end
+	return map
+end
+
+function Agent.record(status)
+	Goal.phase = "RECORDING"
+	GoalUI.setPhase("RECORDING", "writing memory")
+	local myGen = Goal.gen
+	task.spawn(function()
+		repeat task.wait(0.25) until Store.inEdit() or not Agent.checkGen(myGen)
+		if not Agent.checkGen(myGen) then return end
+		local steps = {}
+		for n, b in pairs(Goal.steps) do
+			steps[#steps + 1] = { n = n, status = b.status, outcome = b.outcome, changed = b.changed, writes = b.writes, undoLabels = b.undoLabels }
+		end
+		table.sort(steps, function(x, y) return x.n < y.n end)
+		local record = {
+			v = 1, id = Goal.planId or Store.nextPlanId(Goal.plan and Goal.plan.title or "plan"),
+			status = status or deriveStatus(Goal.steps), createdAt = os.time(),
+			goal = Goal.goalText, focus = S.get("goal_focus", { bugs = true, quality = true }),
+			plan = Goal.plan, revisions = Goal.revisions, steps = steps, verify = Goal.verify,
+			models = Goal.models, estTokens = Goal.estTokens, summary = Goal.plan and Goal.plan.summary or "",
+		}
+		-- trim writes[] per step to WRITES_MAX_CHARS
+		for _, st in ipairs(record.steps) do
+			while #HttpService:JSONEncode(st.writes or {}) > WRITES_MAX_CHARS and #st.writes > 0 do
+				local w = st.writes[#st.writes]
+				if w.replace and #w.replace > 40 then w.replace = utf8Trim(w.replace, 40) elseif w.find and #w.find > 40 then w.find = utf8Trim(w.find, 40) else table.remove(st.writes) end
+			end
+		end
+		local facts = buildFacts()
+		local _, oldNotes = Store.readMemory()
+		local newNotes, summary = oldNotes, record.summary
+		if status ~= "cancelled" and Goal.plan then
+			local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = ("=== MEMORY: FACTS ===\n%s\n\n=== MEMORY: NOTES (current) ===\n%s\n\n=== RECORD ===\n%s\n\n=== PHASE ===\nRewrite Notes (≤ %d chars, keep the headings Game / Conventions / Decisions / Known issues) and give a ≤ %d-char summary of this plan. Call write_memory once."):format(facts, oldNotes ~= "" and oldNotes or "(none)", HttpService:JSONEncode(record), NOTES_MAX, SUMMARY_MAX) } } }
+			local ps = newPhaseState("RECORDING", 1)
+			ps.budget.calls = 1
+			runPhaseLoop(convo, ps, Schemas.forPhase("RECORDING"), "write_memory", function(args)
+				newNotes = utf8Trim(tostring(args.notes or oldNotes), NOTES_MAX)
+				summary = utf8Trim(tostring(args.plan_summary or summary), SUMMARY_MAX)
+				return true
+			end)
+			Goal.estTokens += ps.used.tokens
+			record.estTokens = Goal.estTokens
+			if not Agent.checkGen(myGen) then return end
+		end
+		record.summary = summary
+		-- Build the flattened before/k sources in the SAME pass, over the SAME sorted order
+		-- (record.steps, ascending n), that rewrites ch.before: each step's own beforeSources
+		-- map is read using the ORIGINAL per-step index parsed out of ch.before (Executor.
+		-- runWriteBatch numbers beforeSources/changed[].before locally per step, restarting at
+		-- 1 for every step), and only THEN is ch.before rewritten to the new global index. A
+		-- second, independently-ordered pass (e.g. pairs(Goal.steps) for one loop and the
+		-- sorted record.steps array for the other, as a plain flatten-then-rekey would do)
+		-- could pair one script's ch.before with a DIFFERENT step's source text whenever the
+		-- two orders disagreed, and Revert would then silently overwrite the wrong script with
+		-- the wrong old source.
+		local beforeSources, k = {}, 0
+		for _, st in ipairs(record.steps) do
+			local b = Goal.steps[st.n]
+			for _, ch in ipairs(st.changed or {}) do
+				if ch.before then
+					k += 1
+					beforeSources[k] = (b and b.beforeSources and b.beforeSources[tonumber(ch.before:match("before/(%d+)"))]) or ""
+					ch.before = "before/" .. k
+				end
+			end
+		end
+		local ok, err = Store.withRecording("record", function()
+			Store.writeMemory(facts, newNotes)
+			Store.writeManifest(buildManifest())
+			Store.writePlan(record, beforeSources)
+			Store.applyCaps()
+		end)
+		if not ok then
+			GoalUI.log("record NOT written: " .. tostring(err) .. " — the game changes stand, but this cycle was not saved", "error")
+			Goal.phase = "IDLE"
+			GoalUI.setBusy(false)
+			GoalUI.setPhase("IDLE", "record failed")
+			GoalUI.refreshPlans()
+			return
+		end
+		Goal.phase = "IDLE"
+		GoalUI.setBusy(false)
+		GoalUI.setPhase("IDLE", record.id .. " · " .. record.status)
+		GoalUI.showCard("result", record)
+		GoalUI.refreshPlans()
+	end)
+end
+
+function Agent.revertPlan(id)
+	local rec, err = Store.readPlan(id)
+	if not rec then return false, { error = err } end
+	local report = { restored = {}, skipped = {} }
+	local root = Store.root()
+	local folder = root and root.Plans:FindFirstChild(id)
+	local ok, werr = Store.withRecording("revert " .. id, function()
+		for i = #rec.steps, 1, -1 do
+			local st = rec.steps[i]
+			for j = #(st.changed or {}), 1, -1 do
+				local ch = st.changed[j]
+				local inst = walkPath(ch.path)
+				if ch.kind == "script" and ch.before then
+					local beforeFolder = folder and folder:FindFirstChild("before") and folder.before:FindFirstChild(ch.before:match("before/(.+)"))
+					if inst and inst:IsA("LuaSourceContainer") and beforeFolder then
+						if Tools.hashOf(inst) == ch.hashAfter then
+							local src = Store.readText(beforeFolder)
+							local okW, wErr = Tools.writeSource(inst, function() return src end)
+							if okW then
+								table.insert(report.restored, ch.path)
+							else
+								table.insert(report.skipped, ch.path .. " (write failed: " .. tostring(wErr) .. ")")
+							end
+						else
+							table.insert(report.skipped, ch.path .. " (edited since)")
+						end
+					else
+						table.insert(report.skipped, ch.path .. " (missing)")
+					end
+				elseif ch.created and inst then
+					Store.trash(inst, id .. "-revert"); table.insert(report.restored, ch.path .. " (trashed)")
+				elseif (ch.trashed or ch.origParent) then
+					local item = nil
+					for _, it in ipairs(Store.trashItems()) do
+						local parent, name = it:GetAttribute("RSP_OrigParent"), it:GetAttribute("RSP_OrigName")
+						if it:GetAttribute("RSP_Plan") == id and parent and name and (parent .. "." .. name) == ch.path then
+							item = it
+							break
+						end
+					end
+					local target = item or inst
+					local parent = ch.origParent and walkPath(ch.origParent)
+					if target and parent then target.Parent = parent; table.insert(report.restored, ch.path) else table.insert(report.skipped, ch.path .. " (origin missing)") end
+				else
+					table.insert(report.skipped, tostring(ch.path) .. " (no longer present)")
+				end
+			end
+		end
+	end)
+	if not ok then return false, { error = werr } end
+	return true, report
+end
 
 function Agent.plan(goalText)
 	if Goal.phase ~= "IDLE" then return end
@@ -3538,7 +3727,7 @@ function Agent.cancel()
 	if Goal.phase ~= "AWAITING_APPROVAL" then return end
 	Goal.gen += 1
 	Goal.phase = "RECORDING"
-	Agent.record("cancelled") -- Task 9 replaces this stub.
+	Agent.record("cancelled") -- write_memory is skipped for a cancelled status; see Agent.record
 end
 
 function Agent.stop()
@@ -3791,10 +3980,44 @@ SelfTest.case("agent: afterActing routes by step statuses", function()
 	assert(Agent.allIncludedDone() == false, "failed blocks verify")
 	Goal.plan, Goal.steps = nil, {}
 end)
+SelfTest.case("record: buildFacts is bounded and lists services", function()
+	local f = buildFacts()
+	assert(#f <= FACTS_MAX, "facts within cap: " .. #f)
+	assert(f:find("Workspace", 1, true) and f:find("ServerScriptService", 1, true), "services listed")
+end)
+SelfTest.case("record: status derivation", function()
+	assert(deriveStatus({ { status = "done" }, { status = "skipped" } }) == "done", "done")
+	assert(deriveStatus({ { status = "done" }, { status = "failed" } }) == "partial", "partial")
+	assert(deriveStatus({ { status = "failed" } }) == "failed", "failed")
+end)
+SelfTest.case("record: revert restores untouched scripts and skips edited ones", function()
+	withScratch(function(f)
+		local a = Instance.new("Script"); a.Name = "A"; a.Source = "print('after A')"; a.Parent = f
+		local b = Instance.new("Script"); b.Name = "B"; b.Source = "print('after B, then hand edit')"; b.Parent = f
+		local root = assert(Store.ensure())
+		local rec = { v = 1, id = "Plan_900_revert-test", status = "done", createdAt = os.time(), goal = "g", summary = "s", steps = {
+			{ n = 1, status = "done", changed = {
+				{ path = a:GetFullName(), kind = "script", hashBefore = Store.hash("print('before A')"), hashAfter = Store.hash(a.Source), before = "before/1" },
+				{ path = b:GetFullName(), kind = "script", hashBefore = Store.hash("print('before B')"), hashAfter = Store.hash("print('after B')"), before = "before/2" },
+			} } } }
+		assert(Store.withRecording("test", function() Store.writePlan(rec, { [1] = "print('before A')", [2] = "print('before B')" }) end))
+		local ok, report = Agent.revertPlan("Plan_900_revert-test")
+		assert(ok and #report.restored == 1 and #report.skipped == 1, ("restored %d skipped %d"):format(#report.restored, #report.skipped))
+		assert(a.Source == "print('before A')" and b.Source:find("hand edit", 1, true), "A reverted, B skipped")
+		root.Plans["Plan_900_revert-test"]:Destroy()
+	end)
+end)
 
 -- ═══════════════════════ 11. GOAL UI ═══════════════════════
 
-local goalBox, goalScroll, planButton, phaseLabel, stopGoalButton
+local goalBox, goalScroll, planButton, phaseLabel, stopGoalButton, plansButton, trashButton
+-- showPlansView/showTrashView are forward-declared here (not `local function` at their
+-- definition site below) because buildGoalView's button row, which comes first in source
+-- order, must close over the same upvalue: a bare local-function declaration textually
+-- after buildGoalView would leave that name unresolved to a global at the point the button
+-- row closures compile, and clicking Plans/Trash would fail with "attempt to call a nil
+-- value" the first time, before either function's own local ever came into scope.
+local showPlansView, showTrashView
 local chipButtons = {}
 local FOCUS_IDS = { "bugs", "quality", "perf", "ideas", "polish" }
 
@@ -3854,7 +4077,9 @@ buildGoalView = function(root)
 	end)
 	stopGoalButton = button("Stop", row, UDim2.new(0, 50, 1, 0), UDim2.new(0, 96, 0, 0), function() Agent.stop() end)
 	stopGoalButton.Visible = false
-	phaseLabel = mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -160, 1, 0), Position = UDim2.new(0, 152, 0, 0), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = C.MUTED, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, Text = "idle" }, row)
+	phaseLabel = mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -320, 1, 0), Position = UDim2.new(0, 152, 0, 0), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = C.MUTED, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, Text = "idle" }, row)
+	plansButton = button("Plans", row, UDim2.new(0, 70, 1, 0), UDim2.new(1, -150, 0, 0), function() showPlansView(0) end)
+	trashButton = button("Trash", row, UDim2.new(0, 70, 1, 0), UDim2.new(1, -74, 0, 0), showTrashView)
 	goalScroll = mk("ScrollingFrame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -134), Position = UDim2.new(0, 0, 0, 132), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 6 }, goalView)
 	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }, goalScroll)
 	mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8) }, goalScroll)
@@ -3975,9 +4200,100 @@ local function showFailureCard(step)
 	button("Continue from next", bar, UDim2.new(0, 130, 1, 0), UDim2.new(0, 96, 0, 0), function() f:Destroy(); Agent.continueFrom(step.n) end)
 	button("Stop", bar, UDim2.new(0, 60, 1, 0), UDim2.new(0, 232, 0, 0), function() f:Destroy(); Agent.stop() end)
 end
+
+local function showResultCard(rec)
+	local old = goalScroll:FindFirstChild("ResultCard"); if old then old:Destroy() end
+	local f = card(("%s · %s"):format(rec.id, rec.status)); f.Name = "ResultCard"
+	local done, total = 0, 0
+	for _, st in ipairs(rec.steps or {}) do total += 1; if st.status == "done" then done += 1 end end
+	local v = rec.verify
+	local vtext = v and v.ran and ("Run: %d errors, %d warnings%s%s"):format(#(v.errors or {}), v.warnings or 0, (#(v.preexisting or {}) > 0) and (" (" .. #v.preexisting .. " pre-existing)") or "", (v.repair and v.repair.ran) and " · repaired" or "") or (v and v.overflowed and "Run: capture truncated, inconclusive" or "no verify run")
+	label(f, ("%d/%d steps done · %s"):format(done, total, vtext), C.TEXT, 1)
+	label(f, rec.summary or "", C.MUTED, 2)
+	label(f, "Ctrl+Z removes this record first, then the last step.", C.MUTED, 3)
+	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 4 }, f)
+	button("Plan next", bar, UDim2.new(0, 80, 1, 0), UDim2.new(0, 0, 0, 0), function()
+		for _, c in ipairs(goalScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+		Agent.plan("")
+	end)
+	button("Revert plan", bar, UDim2.new(0, 90, 1, 0), UDim2.new(0, 86, 0, 0), function()
+		if GoalUI.prompt("confirm", { title = "Revert " .. rec.id .. "?", text = "Restores every changed script whose current hash still matches the record, moves created instances to Trash, and puts moved/trashed instances back. Files edited since are skipped and listed." }) == "allow" then
+			local ok, report = Agent.revertPlan(rec.id)
+			GoalUI.log(ok and ("reverted %d, skipped %d: %s"):format(#report.restored, #report.skipped, table.concat(report.skipped, "; ")) or ("revert failed: " .. tostring(report.error)), ok and "ok" or "error")
+		end
+	end)
+	button("View record", bar, UDim2.new(0, 90, 1, 0), UDim2.new(0, 182, 0, 0), function()
+		GoalUI.view(rec.id, rec.summary .. "\n\n" .. HttpService:JSONEncode(rec))
+	end)
+end
+
+showPlansView = function(offset)
+	for _, c in ipairs(goalScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+	local page, total = Store.listPlans(offset)
+	local f = card(("Plans %d–%d of %d"):format(offset + 1, offset + #page, total)); f.Name = "PlansView"
+	for i, p in ipairs(page) do
+		local row = mk("Frame", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = i }, f)
+		mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -150, 1, 0), Position = UDim2.new(0, 6, 0, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("%s · %s · %s"):format(p.id, p.status, p.goal) }, row)
+		button("Open", row, UDim2.new(0, 44, 0, 18), UDim2.new(1, -140, 0, 2), function()
+			local rec = Store.readPlan(p.id)
+			GoalUI.view(p.id, rec and (rec.summary .. "\n\n" .. HttpService:JSONEncode(rec)) or "unreadable record")
+		end)
+		button("Revert", row, UDim2.new(0, 50, 0, 18), UDim2.new(1, -90, 0, 2), function()
+			if GoalUI.prompt("confirm", { title = "Revert " .. p.id .. "?", text = "See result card note." }) == "allow" then
+				local ok, report = Agent.revertPlan(p.id)
+				GoalUI.log(ok and ("reverted %d, skipped %d"):format(#report.restored, #report.skipped) or ("revert failed: " .. tostring(report.error)), ok and "ok" or "error")
+			end
+		end)
+	end
+	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), LayoutOrder = 99 }, f)
+	if offset > 0 then button("Newer", bar, UDim2.new(0, 60, 1, 0), UDim2.new(0, 0, 0, 0), function() showPlansView(math.max(0, offset - 10)) end) end
+	if offset + #page < total then button("Older", bar, UDim2.new(0, 60, 1, 0), UDim2.new(0, 66, 0, 0), function() showPlansView(offset + 10) end) end
+	button("Back", bar, UDim2.new(0, 60, 1, 0), UDim2.new(1, -60, 0, 0), function() f:Destroy() end)
+end
+
+showTrashView = function()
+	for _, c in ipairs(goalScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+	local items = Store.trashItems()
+	local f = card(("Trash (%d)"):format(#items)); f.Name = "TrashView"
+	for i, it in ipairs(items) do
+		local row = mk("Frame", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = i }, f)
+		mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -70, 1, 0), Position = UDim2.new(0, 6, 0, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("%s ← %s"):format(it.Name, it:GetAttribute("RSP_OrigParent") or "?") }, row)
+		button("Restore", row, UDim2.new(0, 60, 0, 18), UDim2.new(1, -64, 0, 2), function()
+			local ok, err = Store.restore(it, nil)
+			if not ok and tostring(err):find("conflict", 1, true) then
+				local a = GoalUI.prompt("confirm", { title = "Name conflict", text = tostring(err) .. "\n\nAllow = rename with _restored, Skip = replace the existing one." })
+				if a == "allow" then Store.restore(it, "rename") elseif a == "skip" then Store.restore(it, "replace") end
+			end
+			showTrashView()
+		end)
+	end
+	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), LayoutOrder = 99 }, f)
+	if #items > 0 then
+		button("Empty Trash", bar, UDim2.new(0, 90, 1, 0), UDim2.new(0, 0, 0, 0), function()
+			if GoalUI.prompt("confirm", { title = "Empty Trash?", text = ("Destroys %d items permanently. Undo works until you close Studio."):format(#items) }) == "allow" then Store.emptyTrash(); showTrashView() end
+		end)
+	end
+	button("Back", bar, UDim2.new(0, 60, 1, 0), UDim2.new(1, -60, 0, 0), function() f:Destroy() end)
+end
+
+GoalUI.refreshPlans = function()
+	if goalScroll and goalScroll:FindFirstChild("PlansView") then showPlansView(0) end
+	local _, total = Store.listPlans(0)
+	local bytes = 0
+	local root = Store.root()
+	if root then
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("StringValue") then bytes += #d.Value end
+		end
+	end
+	if plansButton then plansButton.Text = ("Plans (%d, ~%dkB)"):format(total, math.ceil(bytes / 1024)) end
+	if trashButton then trashButton.Text = ("Trash (%d)"):format(#Store.trashItems()) end
+end
+
 GoalUI.showCard = function(kind, data)
 	if kind == "plan" then showPlanCard(data)
-	elseif kind == "failure" then showFailureCard(data.step) end
+	elseif kind == "failure" then showFailureCard(data.step)
+	elseif kind == "result" then showResultCard(data) end
 end
 
 -- ═══════════════════════ 12. BOOTSTRAP ═══════════════════════
@@ -4124,6 +4440,9 @@ w.Title = "RoScript Pro"
 
 S.warm()
 buildUI(w)
+ChangeHistoryService.OnUndo:Connect(GoalUI.refreshPlans)
+ChangeHistoryService.OnRedo:Connect(GoalUI.refreshPlans)
+GoalUI.refreshPlans()
 
 button.Click:Connect(function()
 	w.Enabled = not w.Enabled
