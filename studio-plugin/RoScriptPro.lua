@@ -3204,6 +3204,8 @@ do
 					return refuseAll("stopped", false)
 				end
 				results[w.index] = r
+				-- No per-write log line here: a later throw in this batch rolls these writes
+				-- back, so only GoalUI.logBatch at the settled return tells the truth.
 				-- §8.3: only a throw (pcall failure, above) rolls the batch back. A graceful
 				-- {ok=false} — a stale hash, an ambiguous find, nothing whitelisted applied —
 				-- is reported to the model and the batch still commits; that outcome is meant
@@ -3239,13 +3241,17 @@ do
 				table.remove(bookkeeping.changed, k)
 			end
 			for k = #bookkeeping.writes, writesAt + 1, -1 do table.remove(bookkeeping.writes, k) end
+			Goal.openRecording = nil
+			GoalUI.logBatch(step, writes, results)
+			return results, committed
 		else
 			ChangeHistoryService:FinishRecording(rec, Enum.FinishRecordingOperation.Commit)
 			table.insert(bookkeeping.undoLabels, "RoScript Pro: " .. label)
 			GoalUI.log(("%s: %d write%s"):format(label, #writes, #writes == 1 and "" or "s"), "ok")
+			Goal.openRecording = nil
+			GoalUI.logBatch(step, writes, results)
+			return results, committed
 		end
-		Goal.openRecording = nil
-		return results, committed
 	end
 end
 
@@ -3543,12 +3549,169 @@ function Agent.stop()
 	end
 	if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
 	GoalUI.setBusy(false)
+	if Goal.phase == "ACTING" or Goal.phase == "REPAIRING" then
+		for _, b in pairs(Goal.steps) do
+			if b.status == "running" then
+				b.status, b.outcome = "stopped", "stopped"
+			end
+		end
+	end
 	if Goal.phase == "PLANNING" or Goal.phase == "AWAITING_APPROVAL" then
 		Goal.phase = "IDLE" -- a Stop before submit_plan writes no record
 		GoalUI.setPhase("IDLE", "stopped")
 	elseif Goal.phase ~= "IDLE" then
 		Goal.phase = "RECORDING"
 		Agent.record("stopped")
+	end
+end
+
+local function stepSeed(step)
+	local parts = {}
+	local facts, notes = Store.readMemory()
+	table.insert(parts, "=== MEMORY: FACTS ===\n" .. (facts ~= "" and facts or "(none)"))
+	table.insert(parts, "=== MEMORY: NOTES ===\n" .. (notes ~= "" and notes or "(none)"))
+	table.insert(parts, "=== APPROVED PLAN ===\n" .. HttpService:JSONEncode(Goal.plan))
+	table.insert(parts, ("=== STEP ===\nYou are executing step %d: %s\n%s\nTargets: %s"):format(step.n, step.title, step.detail, table.concat(step.targets, ", ")))
+	local budget = STEP_SEED_MAX
+	for _, t in ipairs(step.targets) do
+		local inst = Tools.resolve(t)
+		if inst then
+			local ins = Tools.read.inspect({ target = t })
+			if ins.ok then
+				table.insert(parts, ("=== TARGET %s (%s) ===\n%s"):format(inst:GetFullName(), Tools.ref(inst), HttpService:JSONEncode({ props = ins.props, attributes = ins.attributes, children = ins.children })))
+			end
+			if inst:IsA("LuaSourceContainer") and budget > 0 then
+				local src = Tools.readSource(inst)
+				local lines = src:split("\n")
+				local numbered = {}
+				for i, l in ipairs(lines) do numbered[i] = i .. "\t" .. l end
+				local text = table.concat(numbered, "\n")
+				if #text > budget then
+					local head = utf8Trim(text, math.floor(budget * 0.75))
+					local tailStart = #text - math.floor(budget * 0.25) + 1
+					local b = utf8.offset(text, 0, math.min(tailStart, #text)) or tailStart
+					text = head .. "\n… [middle omitted; page with read_script] …\n" .. text:sub(b)
+				end
+				budget -= #text
+				table.insert(parts, ("=== SOURCE %s hash=%s lines=%d ===\n%s"):format(inst:GetFullName(), Store.hash(src), #lines, text))
+			end
+		else
+			table.insert(parts, "=== TARGET " .. t .. " did not resolve; use index/search to find it ===")
+		end
+	end
+	table.insert(parts, "=== PHASE ===\nDo only this step. Read what you need, make the writes, then call finish_step with a plain outcome. If the step cannot be done as written, say why in finish_step instead of improvising.")
+	return table.concat(parts, "\n\n")
+end
+
+function Agent.allIncludedDone()
+	for _, s in ipairs(Goal.plan.steps) do
+		if s.included then
+			local b = Goal.steps[s.n]
+			if not b or b.status ~= "done" then return false end
+		end
+	end
+	return true
+end
+
+-- One step, one conversation. Returns status, outcome.
+function Agent.runStep(step)
+	local b = Goal.steps[step.n] or { n = step.n, changed = {}, writes = {}, undoLabels = {} }
+	Goal.steps[step.n] = b
+	b.status, b.outcome = "running", nil
+	GoalUI.setPhase("ACTING", ("step %d/%d"):format(step.n, #Goal.plan.steps))
+	local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = stepSeed(step) } } }
+	local ps = newPhaseState("ACTING", budgetFor(S.get("goal_effort", "normal")).act)
+	ps.step = step
+	local outcome
+	local ok, why = runPhaseLoop(convo, ps, Schemas.forPhase("ACTING"), "finish_step", function(args)
+		outcome = utf8Trim(tostring(args.outcome or ""), 400)
+		return true
+	end)
+	Goal.estTokens += ps.used.tokens
+	if not Agent.checkGen(ps.myGen) then b.status = "stopped"; b.outcome = "stopped"; return "stopped", "stopped" end
+	if ok then
+		b.status, b.outcome = "done", outcome
+		GoalUI.log(("Step %d · %s · done%s"):format(step.n, step.title, #b.undoLabels > 0 and (" (undo: " .. b.undoLabels[#b.undoLabels]:gsub("RoScript Pro: ", "") .. ")") or ""), "ok")
+	else
+		b.status, b.outcome = "failed", tostring(why)
+		GoalUI.log(("Step %d · %s · failed: %s"):format(step.n, step.title, tostring(why)), "error")
+	end
+	return b.status, b.outcome
+end
+
+local function runFrom(startN)
+	task.spawn(function()
+		local myGen = Goal.gen
+		for _, s in ipairs(Goal.plan.steps) do
+			if s.n >= startN then
+				if not Agent.checkGen(myGen) then return end
+				if RunService:IsRunning() then
+					GoalUI.log("playtest running; waiting for edit mode", "muted")
+					repeat task.wait(0.5) until RunService:IsEdit() or not Agent.checkGen(myGen)
+					if not Agent.checkGen(myGen) then return end
+				end
+				if not s.included then
+					Goal.steps[s.n] = Goal.steps[s.n] or { n = s.n, status = "skipped", outcome = "unticked", changed = {}, writes = {}, undoLabels = {} }
+				else
+					local status = Agent.runStep(s)
+					if status == "stopped" then return end
+					if status == "failed" then
+						for _, later in ipairs(Goal.plan.steps) do
+							if later.n > s.n and not Goal.steps[later.n] then
+								Goal.steps[later.n] = { n = later.n, status = "skipped", outcome = ("not run: step %d failed"):format(s.n), changed = {}, writes = {}, undoLabels = {} }
+							end
+						end
+						GoalUI.showCard("failure", { step = s })
+						return -- Retry/Continue/Stop decide what happens next
+					end
+				end
+			end
+		end
+		Agent.afterActing()
+	end)
+end
+
+function Agent.approve()
+	if Goal.phase ~= "AWAITING_APPROVAL" or not Goal.plan then return end
+	Goal.gen += 1
+	Goal.phase = "ACTING"
+	Goal.planId = Store.nextPlanId(Goal.plan.title)
+	Goal.steps = {}
+	GoalUI.setBusy(true)
+	runFrom(1)
+end
+
+function Agent.retryStep(n)
+	if Goal.phase ~= "ACTING" then return end
+	local step = Goal.plan.steps[n]
+	local prev = Goal.steps[n] and Goal.steps[n].outcome or ""
+	step.baseDetail = step.baseDetail or step.detail
+	step.detail = step.baseDetail .. "\n[previous attempt failed: " .. utf8Trim(prev, 300) .. "]"
+	for k = n + 1, #Goal.plan.steps do if Goal.steps[k] and Goal.steps[k].status == "skipped" and Goal.steps[k].outcome:find("not run", 1, true) then Goal.steps[k] = nil end end
+	Goal.gen += 1
+	runFrom(n)
+end
+
+function Agent.continueFrom(n)
+	if Goal.phase ~= "ACTING" then return end
+	Goal.steps[n].status, Goal.steps[n].outcome = "skipped", "skipped by Jasper after failure"
+	for k = n + 1, #Goal.plan.steps do if Goal.steps[k] and Goal.steps[k].outcome and Goal.steps[k].outcome:find("not run", 1, true) then Goal.steps[k] = nil end end
+	Goal.gen += 1
+	runFrom(n + 1)
+end
+
+function Agent.afterActing()
+	if S.get("goal_verify_enabled", true) and Agent.allIncludedDone() and Agent.startVerify then
+		Goal.phase = "VERIFYING"
+		Agent.startVerify() -- Task 10
+	else
+		Goal.phase = "RECORDING"
+		local anyDone, anyBad = false, false
+		for _, b in pairs(Goal.steps) do
+			if b.status == "done" then anyDone = true end
+			if b.status == "failed" or b.status == "stopped" then anyBad = true end
+		end
+		Agent.record(anyBad and (anyDone and "partial" or "failed") or "done")
 	end
 end
 
@@ -3606,6 +3769,27 @@ SelfTest.case("agent: system message is byte-stable", function()
 	local b = SYS_GOAL
 	assert(a == b and #a > 500, "constant")
 	assert(not buildGoalUserBlock("PHASE X"):find(SYS_GOAL:sub(1, 40), 1, true), "variable block does not repeat the system text")
+end)
+SelfTest.case("agent: stepSeed pre-injects sources with head/tail cap", function()
+	withScratch(function(f)
+		local s = Instance.new("Script"); s.Name = "Big"; s.Source = string.rep("-- line\n", 6000); s.Parent = f
+		local step = { n = 1, title = "t", action = "edit", targets = { "ServerStorage.RSP_TestScratch.Big" }, detail = "d", risk = "low", included = true }
+		Goal.plan = { title = "p", summary = "s", verify_hint = "", steps = { step } }
+		local seed = stepSeed(step)
+		assert(seed:find("You are executing step 1", 1, true), "instruction present")
+		assert(seed:find("page with read_script", 1, true), "cap note present")
+		assert(#seed < STEP_SEED_MAX + 6000, "seed bounded, got " .. #seed)
+		assert(seed:find('"n":1', 1, true) or seed:find("step 1", 1, true), "plan json present")
+		Goal.plan = nil
+	end)
+end)
+SelfTest.case("agent: afterActing routes by step statuses", function()
+	Goal.plan = { steps = { { n = 1, included = true }, { n = 2, included = false } } }
+	Goal.steps = { { n = 1, status = "done" }, { n = 2, status = "skipped" } }
+	assert(Agent.allIncludedDone() == true, "all included done")
+	Goal.steps[1].status = "failed"
+	assert(Agent.allIncludedDone() == false, "failed blocks verify")
+	Goal.plan, Goal.steps = nil, {}
 end)
 
 -- ═══════════════════════ 11. GOAL UI ═══════════════════════
@@ -3693,6 +3877,23 @@ GoalUI.log = function(text, kind)
 	logCard.Name = "ActLog"
 	label(logCard, text, color, #logCard:GetChildren())
 end
+GoalUI.logBatch = function(step, writes, results)
+	local logCard = goalScroll:FindFirstChild("ActLog") or card("Act log")
+	logCard.Name = "ActLog"
+	local row = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = #logCard:GetChildren() }, logCard)
+	mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -50, 1, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.MUTED, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("Step %d · %d write%s"):format(step.n, #writes, #writes == 1 and "" or "s") }, row)
+	button("View", row, UDim2.new(0, 44, 0, 16), UDim2.new(1, -46, 0, 1), function()
+		local lines = {}
+		for _, w in ipairs(writes) do
+			local r = results[w.index] or {}
+			local a = table.clone(w.args)
+			if a.source then a.source = utf8Trim(a.source, 3000) end
+			if a.newText then a.newText = utf8Trim(a.newText, 3000) end
+			table.insert(lines, ("%s → %s\n%s"):format(w.name, r.ok and "ok" or ("FAILED: " .. tostring(r.error)), HttpService:JSONEncode(a)))
+		end
+		GoalUI.view(("Step %d writes"):format(step.n), table.concat(lines, "\n"))
+	end)
+end
 -- Blocking prompt: returns "allow" | "skip" | "stop". Runs in the calling coroutine (a batch, before its recording opens).
 GoalUI.prompt = function(kind, payload)
 	local answer = nil
@@ -3708,6 +3909,17 @@ GoalUI.prompt = function(kind, payload)
 	while answer == nil and widgetAlive() do task.wait(0.05) end
 	closeModal()
 	return answer or "stop"
+end
+-- Read-only modal: no decision to make, just a Close button. Every "View" affordance
+-- uses this; GoalUI.prompt is only for a write that is waiting on an answer.
+GoalUI.view = function(title, text)
+	local _, panel = openModalPanel(title)
+	local body = mk("ScrollingFrame", { BackgroundColor3 = C.CODEBG, Size = UDim2.new(1, -16, 1, -80), Position = UDim2.new(0, 8, 0, 34), AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarThickness = 6 }, panel)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, body)
+	for i, chunk in ipairs(chunkText(text or "")) do
+		mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, RichText = true, Text = escapeRich(chunk), LayoutOrder = i }, body)
+	end
+	button("Close", panel, UDim2.new(0, 70, 0, 26), UDim2.new(0, 8, 1, -34), closeModal)
 end
 
 local RISK_COLOR = { low = C.OK, medium = Color3.fromHex("f59e0b"), high = C.ERR }
@@ -3733,7 +3945,7 @@ local function showPlanCard(plan)
 		mk("Frame", { BackgroundColor3 = RISK_COLOR[s.risk], Size = UDim2.new(0, 8, 0, 8), Position = UDim2.new(0, 26, 0, 8) }, row)
 		local t = mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -110, 1, 0), Position = UDim2.new(0, 40, 0, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("%d. %s  [%s]  %s"):format(s.n, s.title, s.action, table.concat(s.targets, ", ")) }, row)
 		button("View", row, UDim2.new(0, 44, 0, 18), UDim2.new(1, -50, 0, 3), function()
-			GoalUI.prompt("detail", { title = ("Step %d"):format(s.n), text = s.detail .. "\n\nTargets:\n" .. table.concat(s.targets, "\n") })
+			GoalUI.view(("Step %d"):format(s.n), s.detail .. "\n\nTargets:\n" .. table.concat(s.targets, "\n"))
 		end)
 	end
 	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 99 }, f)
@@ -3754,8 +3966,18 @@ local function showPlanCard(plan)
 	end)
 	button("Cancel", bar, UDim2.new(0, 70, 1, 0), UDim2.new(0, 162, 0, 0), function() f:Destroy(); Agent.cancel() end)
 end
+local function showFailureCard(step)
+	local old = goalScroll:FindFirstChild("FailureCard"); if old then old:Destroy() end
+	local f = card(("Step %d failed"):format(step.n)); f.Name = "FailureCard"
+	label(f, Goal.steps[step.n].outcome or "", C.ERR, 1)
+	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 2 }, f)
+	button("Retry step", bar, UDim2.new(0, 90, 1, 0), UDim2.new(0, 0, 0, 0), function() f:Destroy(); Agent.retryStep(step.n) end)
+	button("Continue from next", bar, UDim2.new(0, 130, 1, 0), UDim2.new(0, 96, 0, 0), function() f:Destroy(); Agent.continueFrom(step.n) end)
+	button("Stop", bar, UDim2.new(0, 60, 1, 0), UDim2.new(0, 232, 0, 0), function() f:Destroy(); Agent.stop() end)
+end
 GoalUI.showCard = function(kind, data)
-	if kind == "plan" then showPlanCard(data) end
+	if kind == "plan" then showPlanCard(data)
+	elseif kind == "failure" then showFailureCard(data.step) end
 end
 
 -- ═══════════════════════ 12. BOOTSTRAP ═══════════════════════
