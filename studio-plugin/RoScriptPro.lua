@@ -1,11 +1,12 @@
 --[[ ═══════════════════════════════════════════════════════════════════════════
-  RoScript Pro — Studio plugin v1                                (2026-09-02)
+  RoScript Pro — Studio plugin v2 (Goal Mode)
 
   AI chat assistant inside Roblox Studio: free-tier Groq/OpenRouter/Cerebras
   rotation, auto game context (Explorer selection + open script), one-click
   Insert-as-Script and preview-gated Run-in-Studio, both undo-gated.
 
   Spec: docs/superpowers/specs/2026-09-02-roscript-studio-plugin-design.md
+  Spec v2: docs/superpowers/specs/2026-09-03-roscript-goal-mode-design.md
 
   INSTALL (from the repo root, PowerShell):
     Copy-Item "studio-plugin\RoScriptPro.lua" "$env:LOCALAPPDATA\Roblox\Plugins\"
@@ -32,9 +33,9 @@ local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local ServerStorage = game:GetService("ServerStorage")
 
 local PROV = {
-	groq = { name = "Groq", url = "https://api.groq.com/openai/v1/chat/completions" },
-	cerebras = { name = "Cerebras", url = "https://api.cerebras.ai/v1/chat/completions" },
-	openrouter = { name = "OpenRouter", url = "https://openrouter.ai/api/v1/chat/completions" },
+	groq = { name = "Groq", url = "https://api.groq.com/openai/v1/chat/completions", strictTools = false },
+	cerebras = { name = "Cerebras", url = "https://api.cerebras.ai/v1/chat/completions", strictTools = true },
+	openrouter = { name = "OpenRouter", url = "https://openrouter.ai/api/v1/chat/completions", strictTools = false },
 }
 local PROV_ORDER = { "groq", "cerebras", "openrouter" }
 
@@ -43,14 +44,14 @@ local PROV_ORDER = { "groq", "cerebras", "openrouter" }
 -- nemotron-3-super are PROVISIONAL (reasoning-family, no effort control) — cut
 -- them if spike 4 shows hidden-reasoning wall-clock burn.
 local MODEL_CHAIN = {
-	{ p = "groq", m = "openai/gpt-oss-120b" },
-	{ p = "groq", m = "openai/gpt-oss-20b" },
-	{ p = "cerebras", m = "gpt-oss-120b" },
-	{ p = "cerebras", m = "zai-glm-4.7" },
-	{ p = "openrouter", m = "openai/gpt-oss-120b:free" },
-	{ p = "openrouter", m = "openai/gpt-oss-20b:free" },
-	{ p = "openrouter", m = "nvidia/nemotron-3-super-120b-a12b:free" },
-	{ p = "openrouter", m = "meta-llama/llama-3.3-70b-instruct:free" }, -- flaky, last resort
+	{ p = "groq", m = "openai/gpt-oss-120b", tools = true },
+	{ p = "groq", m = "openai/gpt-oss-20b", tools = true },
+	{ p = "cerebras", m = "gpt-oss-120b", tools = true },
+	{ p = "cerebras", m = "zai-glm-4.7", tools = false }, -- absent from Cerebras docs 2026-09-03
+	{ p = "openrouter", m = "openai/gpt-oss-120b:free", tools = true }, -- S5: endpoints may be empty
+	{ p = "openrouter", m = "openai/gpt-oss-20b:free", tools = true },
+	{ p = "openrouter", m = "nvidia/nemotron-3-super-120b-a12b:free", tools = false },
+	{ p = "openrouter", m = "meta-llama/llama-3.3-70b-instruct:free", tools = false },
 }
 
 -- Output budgets sized to the undocumented (only-shortenable) HttpService
@@ -80,6 +81,55 @@ local LABEL_MAX = 16000 -- chars per TextLabel; longer runs are split
 -- Spike 2 ran 2026-09-03 on this machine: BOTH passed; loadstring ships per
 -- the spec tie-break (no DataModel churn, no module cache).
 local RUN_ENGINE = "loadstring"
+
+-- ─── Goal Mode (v2) constants — spec §4–§6, do not tune without re-reading ───
+local STORE_VERSION = 1
+local MEMORY_MAX, FACTS_MAX, NOTES_MAX, SUMMARY_MAX = 6000, 2500, 3500, 2000
+local CHUNK_MAX = 100000 -- S4 confirms; documented StringValue cap is 200,000
+local PLANS_FED_TO_PLAN, PLANS_KEEP, TRASH_KEEP, TRASH_DAYS = 3, 20, 25, 14
+local INDEX_MAX_ENTRIES, READ_SCRIPT_MAX, SEARCH_MAX_HITS, OUTPUT_MAX_CHARS = 200, 8000, 40, 4000
+local STEP_SEED_MAX, WRITES_MAX_CHARS = 24000, 4000
+local MAX_STEPS, MAX_CONSECUTIVE_TOOL_ERRORS = 10, 3
+local GROQ_REQ_MAX = 3500 -- S6 sets: 8000 - GOAL_MAXTOK.groq if max_tokens counts, else 7000
+local BIG_REQ_MAX = 28000 -- Cerebras 30K TPM
+local GOAL_WAIT_MAX, GOAL_WAITS_PER_REQUEST, CEREBRAS_MIN_GAP = 90, 2, 12
+local GOAL_TEMPERATURE = 0.2
+local GOAL_MAXTOK = { groq = 4096, cerebras = 8192, openrouter = 8192 }
+local BUDGETS = {
+	normal = { plan = 12, revise = 6, act = 8, repair = 6, repairPasses = 1, tokens = 150000 },
+	deep = { plan = 24, revise = 12, act = 16, repair = 12, repairPasses = 2, tokens = 300000 },
+}
+local function budgetFor(effort)
+	return BUDGETS[effort] or BUDGETS.normal
+end
+local PAT_BADTOOLCALL = { "tool_use_failed", "failed_generation" }
+
+-- Upward interface TOOLS/AGENT → GOAL UI. Section 11 fills these (same pattern as UI).
+local GoalUI = {
+	log = function(text, kind) end, -- kind: "info" | "muted" | "error" | "ok"
+	setPhase = function(phase, detail) end,
+	prompt = function(kind, payload) return "allow" end, -- "allow" | "skip" | "stop"
+	showCard = function(kind, data) end, -- "plan" | "verify" | "result"
+	refreshPlans = function() end,
+	setBusy = function(busy) end,
+}
+
+-- Goal Mode session state. AGENT owns it; GOAL UI reads it.
+local Goal = {
+	phase = "IDLE", -- IDLE | PLANNING | AWAITING_APPROVAL | ACTING | VERIFYING | REPAIRING | RECORDING
+	gen = 0, -- Goal Mode's own generation counter (Chat keeps `gen`)
+	plan = nil, -- the submitted plan object
+	planConvo = nil, -- PLANNING transcript kept for Revise
+	revisions = {},
+	steps = {}, -- per-step bookkeeping: { n, status, outcome, changed, writes, undoLabels }
+	verify = nil,
+	goalText = "",
+	models = {},
+	estTokens = 0,
+	requests = {}, -- provider -> count this session
+	openRecording = nil, -- { id, owner = coroutine }
+	stepConvo = nil,
+}
 
 local COOLDOWN_DEFAULT = 30 -- seconds, when no Retry-After is readable
 local COOLDOWN_NETFAIL = 15
@@ -115,7 +165,8 @@ local lastUserBubble = nil
 local S = {}
 do
 	local cache = {}
-	local KNOWN = { "keys_groq", "keys_openrouter", "keys_cerebras", "ctx_enabled", "active_skills" }
+	local KNOWN = { "keys_groq", "keys_openrouter", "keys_cerebras", "ctx_enabled", "active_skills",
+		"goal_mode", "goal_focus", "goal_verify_enabled", "goal_careful", "goal_effort" }
 
 	function S.get(key, default)
 		if cache[key] ~= nil then
@@ -1801,7 +1852,48 @@ renderSettings = function()
 	end)
 end
 
--- ═══════════════════════ 8. BOOTSTRAP ═══════════════════════
+-- ═══════════════════════ 8. STORE ═══════════════════════
+
+-- ─── SelfTest: DEV-only assertions, printed on load. Cases are added by each section. ───
+local SelfTest = { cases = {} }
+function SelfTest.case(name, fn)
+	table.insert(SelfTest.cases, { name = name, fn = fn })
+end
+function SelfTest.run()
+	local pass, fail = 0, 0
+	for _, c in ipairs(SelfTest.cases) do
+		local ok, err = pcall(c.fn)
+		if ok then
+			pass += 1
+			print("[RSP TEST]", c.name, "PASS")
+		else
+			fail += 1
+			print("[RSP TEST]", c.name, "FAIL", tostring(err))
+		end
+	end
+	print(("[RSP TEST] %d passed, %d failed"):format(pass, fail))
+end
+-- Scratch folder for DataModel-touching cases; destroyed at the end of every case.
+local function withScratch(fn)
+	local f = Instance.new("Folder")
+	f.Name = "RSP_TestScratch"
+	f.Parent = game:GetService("ServerStorage")
+	local ok, err = pcall(fn, f)
+	f:Destroy()
+	assert(ok, err)
+end
+SelfTest.case("harness runs", function()
+	assert(budgetFor("deep").plan == 24, "deep plan budget")
+	assert(budgetFor("nonsense").plan == 12, "default budget")
+end)
+
+-- ═══════════════════════ 9. TOOLS ═══════════════════════
+
+-- ═══════════════════════ 10. AGENT ═══════════════════════
+
+-- ═══════════════════════ 11. GOAL UI ═══════════════════════
+
+-- ═══════════════════════ 12. BOOTSTRAP ═══════════════════════
 
 local function historyChars()
 	local n = 0
@@ -1964,3 +2056,7 @@ plugin.Unloading:Connect(function()
 end)
 
 trace("RoScript Pro loaded")
+
+if DEV then
+	SelfTest.run()
+end
