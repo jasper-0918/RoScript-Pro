@@ -2587,6 +2587,289 @@ end)
 
 -- ═══════════════════════ 10. AGENT ═══════════════════════
 
+local Agent = {}
+
+local Schemas = {}
+do
+	-- t(typeName, nullable) builds a JSON-schema type; every property is required (§6.1).
+	local function t(kind, nullable)
+		if nullable then return { type = { kind, "null" } } end
+		return { type = kind }
+	end
+	local STR, INT, BOOL = t("string"), t("integer"), t("boolean")
+	local function arr(items) return { type = "array", items = items } end
+	local function obj(props, order)
+		return { type = "object", properties = props, required = order, additionalProperties = false }
+	end
+	local PAIR = obj({ name = STR, value = STR }, { "name", "value" })
+	local STEP = obj({
+		title = STR, action = { type = "string", enum = { "edit", "create", "move", "trash", "props", "mixed" } },
+		targets = arr(STR), detail = STR, risk = { type = "string", enum = { "low", "medium", "high" } },
+	}, { "title", "action", "targets", "detail", "risk" })
+
+	local DEFS = {
+		index = { "List children of a path: name | class | children | lines | flags | #ref. depth 1-3. 200 entries max, narrow the path if truncated.", obj({ path = t("string", true), depth = t("integer", true) }, { "path", "depth" }) },
+		inspect = { "Whitelisted properties, attributes, tags and children of one instance (path or #ref).", obj({ target = STR }, { "target" }) },
+		read_script = { "Numbered source of a script, optionally a line range. 8000 chars per call; page with fromLine.", obj({ target = STR, fromLine = t("integer", true), toLine = t("integer", true) }, { "target", "fromLine", "toLine" }) },
+		search = { "Find text in scripts under root. Plain case-insensitive substring unless pattern=true (Luau pattern).", obj({ text = STR, root = t("string", true), pattern = t("boolean", true) }, { "text", "root", "pattern" }) },
+		read_output = { "Newest Output errors and warnings, with script paths when present.", obj({ count = t("integer", true) }, { "count" }) },
+		read_memory = { "Project memory: plugin-generated Facts and model-written Notes.", obj({ reason = STR }, { "reason" }) },
+		list_plans = { "Past plan records, 10 per page.", obj({ offset = t("integer", true) }, { "offset" }) },
+		read_plan = { "One plan record, including what its steps actually wrote.", obj({ id = STR }, { "id" }) },
+		replace_lines = { "Replace inclusive line range fromLine..toLine with newText. expectHash must equal the hash read_script returned.", obj({ target = STR, fromLine = INT, toLine = INT, expectHash = STR, newText = STR }, { "target", "fromLine", "toLine", "expectHash", "newText" }) },
+		edit_script = { "Plain-text find/replace in a script. Fails if find is missing or ambiguous (all=false).", obj({ target = STR, find = STR, replace = STR, all = BOOL }, { "target", "find", "replace", "all" }) },
+		write_script = { "Replace a script's whole source. Prefer replace_lines/edit_script for existing scripts.", obj({ target = STR, source = STR }, { "target", "source" }) },
+		create = { "Create an instance. props: array of {name, value} where value is JSON text; attributes use @name.", obj({ class = STR, parent = STR, name = STR, props = { type = { "array", "null" }, items = PAIR }, source = t("string", true) }, { "class", "parent", "name", "props", "source" }) },
+		set_props = { "Set whitelisted properties/attributes on 1-50 targets. props: array of {name, value(JSON text)}; @name = attribute.", obj({ targets = arr(STR), props = arr(PAIR) }, { "targets", "props" }) },
+		move = { "Reparent 1-50 targets.", obj({ targets = arr(STR), newParent = STR }, { "targets", "newParent" }) },
+		trash = { "Move 1-50 targets to the RoScript Pro Trash (never destroys).", obj({ targets = arr(STR) }, { "targets" }) },
+		submit_plan = { "Submit the plan. At most 10 steps.", obj({ title = STR, summary = STR, verify_hint = STR, steps = arr(STEP) }, { "title", "summary", "verify_hint", "steps" }) },
+		finish_step = { "Finish the current step with a one-paragraph outcome.", obj({ outcome = STR }, { "outcome" }) },
+		write_memory = { "Rewrite the Notes block of project memory and give this plan's summary.", obj({ notes = STR, plan_summary = STR }, { "notes", "plan_summary" }) },
+	}
+	local READ = { "index", "inspect", "read_script", "search", "read_output", "read_memory", "list_plans", "read_plan" }
+	local WRITE = { "replace_lines", "edit_script", "write_script", "create", "set_props", "move", "trash" }
+	local PHASES = {
+		PLANNING = { READ, { "submit_plan" } }, REVISING = { READ, { "submit_plan" } },
+		ACTING = { READ, WRITE, { "finish_step" } }, REPAIRING = { READ, WRITE, { "finish_step" } },
+		RECORDING = { { "write_memory" } },
+	}
+	function Schemas.tool(name)
+		local d = assert(DEFS[name], "no schema for " .. name)
+		return { type = "function", ["function"] = { name = name, description = d[1], parameters = d[2] } }
+	end
+	function Schemas.forPhase(phase)
+		local out = {}
+		for _, group in ipairs(PHASES[phase] or {}) do
+			for _, n in ipairs(group) do table.insert(out, Schemas.tool(n)) end
+		end
+		return out
+	end
+	function Schemas.allowed(phase)
+		local set = {}
+		for _, t in ipairs(Schemas.forPhase(phase)) do set[t["function"].name] = true end
+		return set
+	end
+end
+
+local function estimateTokens(messages, tools, lastUsage)
+	if lastUsage and lastUsage.prompt_tokens then
+		-- usage-based: what the provider counted last time plus what we appended since (escaped Luau ≈ 3 chars/token)
+		local added = 0
+		for i = #messages, 1, -1 do
+			local m = messages[i]
+			if m.role == "tool" or (m.role == "user" and i > 1) then added += #(m.content or "") else break end
+		end
+		return lastUsage.prompt_tokens + (lastUsage.completion_tokens or 0) + math.ceil(added / 3)
+	end
+	local ok, json = pcall(function() return HttpService:JSONEncode({ messages = messages, tools = tools }) end)
+	return ok and math.ceil(#json / 4) or 1e9
+end
+
+-- Replace the oldest tool results until under BIG_REQ_MAX. Returns true if anything changed.
+local function compactConvo(convo, tools)
+	local changed = false
+	local ELIDED = "[result elided; call the tool again if needed]"
+	while estimateTokens(convo.messages, tools, nil) > BIG_REQ_MAX do
+		local victim
+		for _, m in ipairs(convo.messages) do
+			if m.role == "tool" and m.content ~= ELIDED then victim = m; break end
+		end
+		if not victim then break end
+		victim.content = ELIDED
+		changed = true
+	end
+	return changed
+end
+
+function Agent.checkGen(myGen)
+	return myGen == Goal.gen and not unloaded
+end
+
+local lastCerebrasAt = {} -- key idx -> os.clock()
+
+-- One model turn with all the free-tier survival rules (§6.4, §6.7).
+local function requestWithWaits(convo, ps, tools)
+	local waits = 0
+	while true do
+		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
+		local est = estimateTokens(convo.messages, tools, convo.lastUsage)
+		if est > BIG_REQ_MAX then
+			compactConvo(convo, tools)
+			est = estimateTokens(convo.messages, tools, nil)
+			if est > BIG_REQ_MAX then return nil, "context too large for the free tiers" end
+		end
+		if ps.used.tokens + est > ps.budget.tokens then
+			ps.exhausted = true
+			return nil, "phase token ceiling reached"
+		end
+		-- Cerebras pacing: 5 RPM, no retry-after published.
+		for idx, at in pairs(lastCerebrasAt) do
+			local gap = CEREBRAS_MIN_GAP - (os.clock() - at)
+			if gap > 0 and gap < CEREBRAS_MIN_GAP then
+				GoalUI.setPhase(ps.phase, ("pacing Cerebras key #%d, %ds"):format(idx, math.ceil(gap)))
+				task.wait(gap)
+				if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
+			end
+		end
+		local state = { failedModels = {}, failedProviders = {} }
+		local opts = { goal = true, tools = tools, temperature = GOAL_TEMPERATURE, estTokens = est, maxTokens = nil }
+		local result, err = chatOnce(convo.messages, state, function(text) GoalUI.setPhase(ps.phase, text) end, opts)
+		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
+		if result then
+			ps.used.tokens += (result.usage and result.usage.total_tokens) or est
+			convo.lastUsage = result.usage
+			Goal.requests[result.entry.p] = (Goal.requests[result.entry.p] or 0) + 1
+			if result.entry.p == "cerebras" then lastCerebrasAt[result.entry.idx] = os.clock() end
+			local tag = result.entry.p .. "/" .. result.entry.m
+			if not table.find(Goal.models, tag) then table.insert(Goal.models, tag) end
+			return result
+		end
+		-- too large somewhere: compact once and retry the remaining queue
+		if state.lastCode == 413 and not convo.compactedOnce then
+			convo.compactedOnce = true
+			if compactConvo(convo, tools) then continue end
+		end
+		-- cooldown wait: only when something is merely cooling
+		local soonest
+		for id, deadline in pairs(Cooling) do
+			local p = id:match("^(%w+):")
+			if not Bad[id] and not state.failedProviders[p] then
+				local dt = deadline - os.clock()
+				if dt > 0 and (not soonest or dt < soonest) then soonest = dt end
+			end
+		end
+		if soonest and soonest <= GOAL_WAIT_MAX and waits < GOAL_WAITS_PER_REQUEST then
+			waits += 1
+			GoalUI.setPhase(ps.phase, ("waiting %ds for a key to cool"):format(math.ceil(soonest)))
+			task.wait(soonest + 1)
+			continue
+		end
+		return nil, err
+	end
+end
+
+local CONTROL = { submit_plan = true, finish_step = true, write_memory = true }
+local WRITE_TOOLS = { replace_lines = true, edit_script = true, write_script = true, create = true, set_props = true, move = true, trash = true }
+
+local function decodeArgs(call)
+	local ok, args = pcall(function() return HttpService:JSONDecode(call["function"].arguments or "{}") end)
+	if not ok or type(args) ~= "table" then return nil, "arguments are not a JSON object" end
+	return args
+end
+
+local Executor = { runWriteBatch = function(writes, ps) local r = {}; for _, w in ipairs(writes) do r[w.index] = { ok = false, error = "write tools not built yet", attributable = false } end; return r, false end }
+
+-- Returns results (one per call, in order) and the control call {name, args} if the batch committed.
+local function runToolBatch(calls, ps)
+	local results = {}
+	local allowed = Schemas.allowed(ps.phase)
+	local nonControl = 0
+	for _, c in ipairs(calls) do if not CONTROL[c["function"].name] then nonControl += 1 end end
+	if ps.used.calls + nonControl > ps.budget.calls then
+		ps.exhausted = true
+		for _, c in ipairs(calls) do
+			table.insert(results, { id = c.id, content = HttpService:JSONEncode({ ok = false, error = "call budget exhausted", attributable = false }) })
+		end
+		return results, nil
+	end
+	local writes, control = {}, nil
+	local anyOk, anyFail, allAttributable = false, false, true
+	local pending = {} -- index -> result table (writes are filled by the executor)
+	for i, c in ipairs(calls) do
+		local name = c["function"].name
+		local args, aerr = decodeArgs(c)
+		if not allowed[name] then
+			local names = {}
+			for n in pairs(allowed) do table.insert(names, n) end
+			table.sort(names)
+			pending[i] = { ok = false, error = ("no tool named %s in this phase; available: %s"):format(name, table.concat(names, ", ")) }
+		elseif not args then
+			pending[i] = { ok = false, error = aerr }
+		elseif CONTROL[name] then
+			if control then
+				pending[i] = { ok = false, error = "only one control call per turn; " .. name .. " ignored", attributable = false }
+			else
+				control = { name = name, args = args, index = i }
+			end
+		elseif WRITE_TOOLS[name] then
+			table.insert(writes, { index = i, name = name, args = args })
+		else
+			ps.used.calls += 1
+			local okR, r = pcall(Tools.read[name], args)
+			pending[i] = okR and r or { ok = false, error = "tool crashed: " .. tostring(r) }
+		end
+	end
+	local committed = true
+	if #writes > 0 then
+		ps.used.calls += #writes
+		local wres, wcommitted = Executor.runWriteBatch(writes, ps)
+		committed = wcommitted
+		for _, w in ipairs(writes) do pending[w.index] = wres[w.index] end
+	end
+	if control then
+		if committed then
+			pending[control.index] = { ok = true }
+		else
+			pending[control.index] = { ok = false, error = control.name .. " ignored: batch did not commit", attributable = false }
+			control = nil
+		end
+	end
+	for i, c in ipairs(calls) do
+		local r = pending[i] or { ok = false, error = "no result" }
+		if r.ok then
+			anyOk = true
+		elseif not CONTROL[c["function"].name] then
+			anyFail = true
+			if r.attributable == false then
+				allAttributable = false
+			end
+		end
+		results[i] = { id = c.id, content = HttpService:JSONEncode(r) }
+	end
+	if anyFail and not anyOk and allAttributable then ps.consecutiveErrors += 1 else ps.consecutiveErrors = 0 end
+	return results, control
+end
+
+SelfTest.case("agent: schemas obey strict rules", function()
+	local json = HttpService:JSONEncode(Schemas.forPhase("PLANNING"))
+	assert(not json:find('"properties":[]', 1, true), "no empty properties arrays")
+	assert(not json:find("minItems", 1, true) and not json:find("maxLength", 1, true), "no bounds in schema")
+	local rs = Schemas.tool("read_script")
+	local p = rs["function"].parameters
+	assert(p.additionalProperties == false, "additionalProperties false")
+	assert(#p.required == 3, "all props required, got " .. #p.required)
+	assert(type(p.properties.fromLine.type) == "table" and p.properties.fromLine.type[2] == "null", "optional is nullable")
+	local names = {}
+	for _, t in ipairs(Schemas.forPhase("ACTING")) do names[t["function"].name] = true end
+	assert(names.write_script and names.finish_step and not names.submit_plan, "acting set")
+	local rec = Schemas.forPhase("RECORDING")
+	assert(#rec == 1 and rec[1]["function"].name == "write_memory", "recording set")
+end)
+SelfTest.case("agent: estimate and compaction", function()
+	local convo = { messages = { { role = "system", content = string.rep("s", 4000) }, { role = "user", content = "u" } } }
+	for i = 1, 6 do
+		table.insert(convo.messages, { role = "assistant", content = "", tool_calls = { { id = "c" .. i, type = "function", ["function"] = { name = "index", arguments = "{}" } } } })
+		table.insert(convo.messages, { role = "tool", tool_call_id = "c" .. i, content = string.rep("t", 20000) })
+	end
+	local before = estimateTokens(convo.messages, {}, nil)
+	assert(before > 30000, "big convo estimate " .. before)
+	assert(compactConvo(convo) == true, "compacted")
+	assert(convo.messages[4].content:find("elided", 1, true), "oldest tool result elided first")
+	assert(estimateTokens(convo.messages, {}, nil) <= BIG_REQ_MAX, "under cap after compaction")
+	assert(estimateTokens({ { role = "user", content = "x" } }, {}, { prompt_tokens = 1000, completion_tokens = 50 }) >= 1050, "usage-based estimate")
+end)
+SelfTest.case("agent: batch budget rule", function()
+	local ps = { phase = "PLANNING", budget = { calls = 2, tokens = 1e9 }, used = { calls = 1, tokens = 0 }, consecutiveErrors = 0, turns = 0, myGen = Goal.gen }
+	local calls = {
+		{ id = "a", ["function"] = { name = "read_memory", arguments = '{"reason":"x"}' } },
+		{ id = "b", ["function"] = { name = "read_memory", arguments = '{"reason":"y"}' } },
+	}
+	local results, control = runToolBatch(calls, ps)
+	assert(#results == 2 and results[1].content:find("budget exhausted", 1, true), "over-budget batch executes nothing")
+	assert(ps.exhausted == true, "phase flagged exhausted")
+end)
+
 -- ═══════════════════════ 11. GOAL UI ═══════════════════════
 
 -- ═══════════════════════ 12. BOOTSTRAP ═══════════════════════
