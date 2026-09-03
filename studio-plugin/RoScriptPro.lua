@@ -1183,6 +1183,7 @@ local unloaded = false
 local bubbleOrder = 0
 local chatScroll, statusLabel, inputBox, sendButton, ctxButton
 local settingsPanel, modalHost
+local buildGoalView, chatView, goalView
 local onSendRef = function() end
 local onStopRef = function() end
 local busyState = false
@@ -1244,7 +1245,7 @@ local function openModalPanel(titleText)
 		Size = UDim2.new(1, -20, 1, -40),
 		Position = UDim2.new(0, 10, 0, 32),
 	}, panel)
-	return body
+	return body, panel
 end
 
 -- Read-only selectable source view: the copy affordance (no clipboard API).
@@ -1606,6 +1607,7 @@ local renderSettings -- defined below, referenced by buildUI
 local function buildUI(w)
 	widget = w
 	local root = mk("Frame", { BackgroundColor3 = C.BG, Size = UDim2.new(1, 0, 1, 0) }, widget)
+	chatView = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -32), Position = UDim2.new(0, 0, 0, 32) }, root)
 
 	-- Top bar
 	local topBar = mk("Frame", { BackgroundColor3 = C.PANEL, Size = UDim2.new(1, 0, 0, 30) }, root)
@@ -1640,16 +1642,28 @@ local function buildUI(w)
 		Text = "Set",
 	}, topBar)
 	mk("UICorner", { CornerRadius = UDim.new(0, 4) }, gearButton)
+	local modeButton = mk("TextButton", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(0, 64, 0, 22), Position = UDim2.new(1, -170, 0, 4), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = C.TEXT, Text = S.get("goal_mode", false) and "Goal" or "Chat", AutoButtonColor = false }, topBar)
+	mk("UICorner", { CornerRadius = UDim.new(0, 4) }, modeButton)
+	local function setGoalMode(on)
+		S.set("goal_mode", on)
+		modeButton.Text = on and "Goal" or "Chat"
+		chatView.Visible = not on
+		goalView.Visible = on
+		ctxButton.TextColor3 = on and C.MUTED or C.TEXT
+	end
+	modeButton.MouseButton1Click:Connect(function() setGoalMode(not S.get("goal_mode", false)) end)
+	modeButton.MouseEnter:Connect(function() modeButton.BackgroundColor3 = C.ACCENT end)
+	modeButton.MouseLeave:Connect(function() modeButton.BackgroundColor3 = C.PANEL2 end)
 
 	-- Chat scroll
 	chatScroll = mk("ScrollingFrame", {
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 1, -98),
-		Position = UDim2.new(0, 0, 0, 32),
+		Size = UDim2.new(1, 0, 1, -66),
+		Position = UDim2.new(0, 0, 0, 0),
 		CanvasSize = UDim2.new(0, 0, 0, 0),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollBarThickness = 6,
-	}, root)
+	}, chatView)
 	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }, chatScroll)
 	mk("UIPadding", {
 		PaddingTop = UDim.new(0, 8),
@@ -1663,7 +1677,7 @@ local function buildUI(w)
 		BackgroundColor3 = C.PANEL,
 		Size = UDim2.new(1, 0, 0, 64),
 		Position = UDim2.new(0, 0, 1, -64),
-	}, root)
+	}, chatView)
 	inputBox = mk("TextBox", {
 		BackgroundColor3 = C.PANEL2,
 		Size = UDim2.new(1, -86, 0, 48),
@@ -1736,6 +1750,9 @@ local function buildUI(w)
 	UI.setStatus = setStatus
 	UI.addBubble = addBubble
 	UI.setBusy = setBusy
+
+	buildGoalView(root)
+	setGoalMode(S.get("goal_mode", false))
 end
 
 renderSettings = function()
@@ -2690,6 +2707,14 @@ local lastCerebrasAt = {} -- key idx -> os.clock()
 
 -- One model turn with all the free-tier survival rules (§6.4, §6.7).
 local function requestWithWaits(convo, ps, tools)
+	-- Every status write is generation-checked: chatOnce can call this several
+	-- times per request while walking the queue, and a Stop mid-flight must not
+	-- leave a stale phase on the label.
+	local function say(text)
+		if Agent.checkGen(ps.myGen) then
+			GoalUI.setPhase(ps.phase, text)
+		end
+	end
 	local waits = 0
 	while true do
 		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
@@ -2707,14 +2732,14 @@ local function requestWithWaits(convo, ps, tools)
 		for idx, at in pairs(lastCerebrasAt) do
 			local gap = CEREBRAS_MIN_GAP - (os.clock() - at)
 			if gap > 0 and gap < CEREBRAS_MIN_GAP then
-				GoalUI.setPhase(ps.phase, ("pacing Cerebras key #%d, %ds"):format(idx, math.ceil(gap)))
+				say(("pacing Cerebras key #%d, %ds"):format(idx, math.ceil(gap)))
 				task.wait(gap)
 				if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 			end
 		end
 		local state = { failedModels = {}, failedProviders = {} }
 		local opts = { goal = true, tools = tools, temperature = GOAL_TEMPERATURE, estTokens = est, maxTokens = nil }
-		local result, err = chatOnce(convo.messages, state, function(text) GoalUI.setPhase(ps.phase, text) end, opts)
+		local result, err = chatOnce(convo.messages, state, say, opts)
 		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		if result then
 			ps.used.tokens += (result.usage and result.usage.total_tokens) or est
@@ -2741,7 +2766,7 @@ local function requestWithWaits(convo, ps, tools)
 		end
 		if soonest and soonest <= GOAL_WAIT_MAX and waits < GOAL_WAITS_PER_REQUEST then
 			waits += 1
-			GoalUI.setPhase(ps.phase, ("waiting %ds for a key to cool"):format(math.ceil(soonest)))
+			say(("waiting %ds for a key to cool"):format(math.ceil(soonest)))
 			task.wait(soonest + 1)
 			continue
 		end
@@ -2831,6 +2856,238 @@ local function runToolBatch(calls, ps)
 	return results, control
 end
 
+-- Shared default so all five `S.get("goal_focus", ...)` call sites (below and
+-- in section 11) agree on what "no setting yet" means; declared before
+-- buildGoalUserBlock, its earliest use site in source order.
+local DEFAULT_FOCUS = { bugs = true, quality = true }
+
+local SYS_GOAL = [==[You are RoScript Pro Goal Mode, an engineering agent working INSIDE Roblox Studio through tools. You never see the screen; you read the place through index/inspect/read_script/search/read_output and change it only through the write tools.
+
+Rules:
+- Work in phases. In PLANNING you may only read; finish by calling submit_plan. In ACTING you execute exactly one approved step; finish by calling finish_step. In RECORDING you call write_memory once.
+- Targets are full paths (ServerScriptService.Shop) or refs (#r17) exactly as tools emitted them. Never invent paths.
+- Prefer replace_lines (anchored to read_script's hash) or edit_script over write_script. Never rewrite a file you have not read.
+- You cannot destroy anything. trash moves instances to a recoverable folder; Jasper empties it.
+- Source you write must be valid Luau; a syntax error is refused. Keep Roblox conventions: server logic in ServerScriptService, client logic in StarterPlayerScripts/StarterGui LocalScripts, shared modules in ReplicatedStorage.
+- ServerStorage.RoScriptPro is this plugin's memory store. Read it through read_memory/list_plans/read_plan, never edit it.
+- Facts in memory are plugin-measured and win over Notes on conflict.
+- Be economical: one index at depth 1, then drill only where the goal points. Say what you did in finish_step, plainly, no praise.]==]
+
+-- Everything variable goes in the FIRST USER message (§6.6), never in the system message.
+local function buildGoalUserBlock(phaseInstruction)
+	local parts = {}
+	local facts, notes = Store.readMemory()
+	table.insert(parts, "=== MEMORY: FACTS ===\n" .. (facts ~= "" and facts or "(none yet)"))
+	table.insert(parts, "=== MEMORY: NOTES ===\n" .. (notes ~= "" and notes or "(none yet)"))
+	local page = Store.listPlans(0)
+	local summaries = {}
+	for i = 1, math.min(PLANS_FED_TO_PLAN, #page) do
+		local rec = Store.readPlan(page[i].id)
+		if rec then
+			local s = ("%s [%s] %s"):format(rec.id, rec.status, rec.summary or "")
+			for _, st in ipairs(rec.steps or {}) do
+				if st.status == "failed" or st.status == "stopped" then s ..= ("\n  step %d %s: %s"):format(st.n, st.status, st.outcome or "") end
+			end
+			for _, rv in ipairs(rec.revisions or {}) do
+				if rv.note then s ..= "\n  revision note: " .. rv.note end
+			end
+			table.insert(summaries, s)
+		end
+	end
+	table.insert(parts, "=== RECENT PLANS ===\n" .. (#summaries > 0 and table.concat(summaries, "\n") or "(none)"))
+	local sel = buildSelectionSummary()
+	if sel then table.insert(parts, "=== SELECTION ===\n" .. sel) end
+	local active = StudioService.ActiveScript
+	if active then
+		local n = select(2, Tools.readSource(active):gsub("\n", "")) + 1
+		table.insert(parts, ("=== ACTIVE SCRIPT ===\n%s (%s, %d lines) %s"):format(active:GetFullName(), active.ClassName, n, Tools.ref(active)))
+	end
+	if S.get("goal_focus", DEFAULT_FOCUS).bugs then
+		local o = Tools.read.read_output({ count = 40 })
+		if o.ok and #o.lines > 0 then table.insert(parts, "=== RECENT OUTPUT ERRORS ===\n" .. table.concat(o.lines, "\n")) end
+	end
+	local idx = Tools.read.index({ path = "game", depth = 1 })
+	table.insert(parts, "=== TOP-LEVEL INDEX ===\n" .. (idx.ok and idx.text or ""))
+	table.insert(parts, "=== PHASE ===\n" .. phaseInstruction)
+	return table.concat(parts, "\n\n")
+end
+
+local ACTIONS = { edit = true, create = true, move = true, trash = true, props = true, mixed = true }
+local RISKS = { low = true, medium = true, high = true }
+local function validatePlan(obj)
+	if type(obj) ~= "table" or type(obj.steps) ~= "table" then return nil, "plan must have steps" end
+	if #obj.steps == 0 then return nil, "plan has no steps" end
+	if #obj.steps > MAX_STEPS then return nil, ("at most %d steps, got %d"):format(MAX_STEPS, #obj.steps) end
+	local plan = { title = utf8Trim(tostring(obj.title or "Untitled"), 80), summary = utf8Trim(tostring(obj.summary or ""), 600), verify_hint = utf8Trim(tostring(obj.verify_hint or ""), 200), steps = {} }
+	for i, s in ipairs(obj.steps) do
+		if type(s) ~= "table" then return nil, "step " .. i .. " is not an object" end
+		if not ACTIONS[s.action] then return nil, ("step %d has unknown action %s"):format(i, tostring(s.action)) end
+		if type(s.targets) ~= "table" or #s.targets == 0 then return nil, ("step %d needs at least one target in targets"):format(i) end
+		plan.steps[i] = { n = i, title = utf8Trim(tostring(s.title or ""), 80), action = s.action, targets = s.targets, detail = utf8Trim(tostring(s.detail or ""), 500), risk = RISKS[s.risk] and s.risk or "medium", included = true }
+	end
+	return plan
+end
+
+local FOCUS_LABELS = { bugs = "Bugs and errors", quality = "Code quality", perf = "Performance", ideas = "Gameplay ideas", polish = "Polish" }
+local function focusText()
+	local f = S.get("goal_focus", DEFAULT_FOCUS)
+	local out = {}
+	for _, id in ipairs({ "bugs", "quality", "perf", "ideas", "polish" }) do
+		if f[id] then table.insert(out, FOCUS_LABELS[id]) end
+	end
+	if #out == 0 then for _, id in ipairs({ "bugs", "quality", "perf", "ideas", "polish" }) do table.insert(out, FOCUS_LABELS[id]) end end
+	return table.concat(out, ", ")
+end
+
+local function newPhaseState(phase, calls)
+	local b = budgetFor(S.get("goal_effort", "normal"))
+	return { phase = phase, budget = { calls = calls, tokens = b.tokens }, used = { calls = 0, tokens = 0 }, consecutiveErrors = 0, turns = 0, nudged = false, myGen = Goal.gen }
+end
+
+-- Generic tool loop for one phase. onControl(name, args) returns true to end the phase.
+local function runPhaseLoop(convo, ps, tools, controlName, onControl)
+	local maxTurns = ps.budget.calls + 2
+	while true do
+		if not Agent.checkGen(ps.myGen) then return false, "stopped" end
+		if ps.exhausted then return false, "budget" end
+		if ps.consecutiveErrors >= MAX_CONSECUTIVE_TOOL_ERRORS then return false, "three consecutive tool errors" end
+		ps.turns += 1
+		if ps.turns > maxTurns then return false, "too many model turns" end
+		local result, err = requestWithWaits(convo, ps, tools)
+		if not result then return false, err end
+		local assistant = { role = "assistant", content = result.text or "", tool_calls = result.toolCalls, reasoning = result.reasoning }
+		table.insert(convo.messages, assistant)
+		if result.truncated and result.toolCalls then
+			for _, c in ipairs(result.toolCalls) do
+				table.insert(convo.messages, { role = "tool", tool_call_id = c.id, content = HttpService:JSONEncode({ ok = false, error = "tool call cut off by the output limit; use replace_lines or edit_script, or split the change", attributable = false }) })
+			end
+			continue
+		end
+		if not result.toolCalls then
+			if ps.nudged then return false, "model stopped calling tools" end
+			ps.nudged = true
+			table.insert(convo.messages, { role = "user", content = ("Call %s to finish, or continue with tools."):format(controlName) })
+			continue
+		end
+		ps.nudged = false
+		local results, control = runToolBatch(result.toolCalls, ps)
+		for _, r in ipairs(results) do
+			table.insert(convo.messages, { role = "tool", tool_call_id = r.id, content = r.content })
+		end
+		if control and control.name == controlName then
+			local done, msg = onControl(control.args)
+			if done then return true end
+			table.insert(convo.messages, { role = "user", content = msg }) -- one correction round
+		end
+	end
+end
+
+-- Task 9 replaces this stub.
+function Agent.record(status) Goal.phase = "IDLE"; GoalUI.setBusy(false); GoalUI.setPhase("IDLE", tostring(status)) end
+
+function Agent.plan(goalText)
+	if Goal.phase ~= "IDLE" then return end
+	if RunService:IsRunning() then GoalUI.log("stop the playtest first", "error"); return end
+	local root, err = Store.ensure()
+	if not root then GoalUI.log(err, "error"); return end
+	Goal.gen += 1
+	Goal.phase = "PLANNING"
+	Goal.goalText = goalText or ""
+	Goal.plan, Goal.revisions, Goal.steps, Goal.verify, Goal.models, Goal.estTokens = nil, {}, {}, nil, {}, 0
+	GoalUI.setBusy(true)
+	local instruction
+	if #Goal.goalText > 0 then
+		instruction = ("GOAL: %s\nFocus areas: %s\nInvestigate with the read tools until you can write a plan of at most %d steps. Each step must name its targets by path or #ref; selected instances and the active script are the likely targets when the goal says 'this'. Prefer replace_lines or edit_script over rewrites. Mark risk honestly. Then call submit_plan."):format(Goal.goalText, focusText(), MAX_STEPS)
+	else
+		instruction = ("PLAN NEXT: propose the most valuable improvements along these focus areas: %s. Read what you need, then call submit_plan with at most %d steps."):format(focusText(), MAX_STEPS)
+	end
+	local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = buildGoalUserBlock(instruction) } } }
+	Goal.planConvo = convo
+	local ps = newPhaseState("PLANNING", budgetFor(S.get("goal_effort", "normal")).plan)
+	task.spawn(function()
+		local tools = Schemas.forPhase("PLANNING")
+		local ok, why = runPhaseLoop(convo, ps, tools, "submit_plan", function(args)
+			local plan, verr = validatePlan(args)
+			if not plan then return false, "Plan rejected: " .. verr .. ". Call submit_plan again." end
+			Goal.plan = plan
+			return true
+		end)
+		if not Agent.checkGen(ps.myGen) then return end
+		Goal.estTokens += ps.used.tokens
+		if not ok and why == "budget" then
+			-- one last chance: submit_plan only (§6.3)
+			table.insert(convo.messages, { role = "user", content = "Budget reached. Submit the best plan you can from what you have read; mark uncertain steps risk: high. Call submit_plan now." })
+			local ps2 = newPhaseState("PLANNING", 1)
+			ps2.myGen = ps.myGen
+			ok, why = runPhaseLoop(convo, ps2, { Schemas.tool("submit_plan") }, "submit_plan", function(args)
+				local plan, verr = validatePlan(args)
+				if not plan then return false, verr end
+				Goal.plan = plan
+				return true
+			end)
+			if not Agent.checkGen(ps.myGen) then return end
+		end
+		GoalUI.setBusy(false)
+		if ok then
+			Goal.phase = "AWAITING_APPROVAL"
+			GoalUI.setPhase("AWAITING_APPROVAL", "plan ready")
+			GoalUI.showCard("plan", Goal.plan)
+		else
+			Goal.phase = "IDLE"
+			GoalUI.setPhase("IDLE", "planning failed: " .. tostring(why))
+			GoalUI.log("planning failed: " .. tostring(why), "error")
+		end
+	end)
+end
+
+function Agent.revise(note)
+	if Goal.phase ~= "AWAITING_APPROVAL" or not Goal.planConvo then return end
+	table.insert(Goal.revisions, { plan = Goal.plan, note = note, at = os.time() })
+	Goal.gen += 1
+	Goal.phase = "PLANNING"
+	GoalUI.setBusy(true)
+	local convo = Goal.planConvo
+	table.insert(convo.messages, { role = "user", content = "[revision note] " .. note .. "\nRevise the plan and call submit_plan again." })
+	local ps = newPhaseState("REVISING", budgetFor(S.get("goal_effort", "normal")).revise)
+	task.spawn(function()
+		local ok, why = runPhaseLoop(convo, ps, Schemas.forPhase("REVISING"), "submit_plan", function(args)
+			local plan, verr = validatePlan(args)
+			if not plan then return false, "Plan rejected: " .. verr .. ". Call submit_plan again." end
+			Goal.plan = plan
+			return true
+		end)
+		if not Agent.checkGen(ps.myGen) then return end
+		Goal.estTokens += ps.used.tokens
+		GoalUI.setBusy(false)
+		Goal.phase = ok and "AWAITING_APPROVAL" or "IDLE"
+		if ok then GoalUI.showCard("plan", Goal.plan) else GoalUI.log("revise failed: " .. tostring(why), "error") end
+	end)
+end
+
+function Agent.cancel()
+	if Goal.phase ~= "AWAITING_APPROVAL" then return end
+	Goal.gen += 1
+	Goal.phase = "RECORDING"
+	Agent.record("cancelled") -- Task 9 replaces this stub.
+end
+
+function Agent.stop()
+	Goal.gen += 1
+	local rec = Goal.openRecording
+	if rec and rec.owner ~= coroutine.running() then
+		-- the owning batch coroutine cancels at its next gen check (§8.3); nothing to do here
+	end
+	if Goal.verifyConn then Goal.verifyConn:Disconnect(); Goal.verifyConn = nil end
+	GoalUI.setBusy(false)
+	if Goal.phase == "PLANNING" or Goal.phase == "AWAITING_APPROVAL" then
+		Goal.phase = "IDLE" -- a Stop before submit_plan writes no record
+		GoalUI.setPhase("IDLE", "stopped")
+	elseif Goal.phase ~= "IDLE" then
+		Goal.phase = "RECORDING"
+		Agent.record("stopped")
+	end
+end
+
 SelfTest.case("agent: schemas obey strict rules", function()
 	local json = HttpService:JSONEncode(Schemas.forPhase("PLANNING"))
 	assert(not json:find('"properties":[]', 1, true), "no empty properties arrays")
@@ -2869,8 +3126,173 @@ SelfTest.case("agent: batch budget rule", function()
 	assert(#results == 2 and results[1].content:find("budget exhausted", 1, true), "over-budget batch executes nothing")
 	assert(ps.exhausted == true, "phase flagged exhausted")
 end)
+SelfTest.case("agent: validatePlan enforces limits", function()
+	local steps = {}
+	for i = 1, MAX_STEPS + 1 do steps[i] = { title = "s" .. i, action = "edit", targets = { "Workspace.X" }, detail = "d", risk = "low" } end
+	local _, err = validatePlan({ title = "t", summary = "s", verify_hint = "v", steps = steps })
+	assert(err and err:find("10", 1, true), "too many steps rejected: " .. tostring(err))
+	local plan = assert(validatePlan({ title = string.rep("t", 200), summary = "s", verify_hint = "v", steps = { steps[1] } }))
+	assert(#plan.title == 80, "title trimmed to 80, got " .. #plan.title)
+	assert(plan.steps[1].n == 1 and plan.steps[1].included == true, "steps numbered and included")
+	local _, e2 = validatePlan({ title = "t", summary = "s", verify_hint = "v", steps = { { title = "x", action = "edit", targets = {}, detail = "d", risk = "low" } } })
+	assert(e2 and e2:find("targets", 1, true), "empty targets rejected")
+end)
+SelfTest.case("agent: system message is byte-stable", function()
+	local a = SYS_GOAL
+	local b = SYS_GOAL
+	assert(a == b and #a > 500, "constant")
+	assert(not buildGoalUserBlock("PHASE X"):find(SYS_GOAL:sub(1, 40), 1, true), "variable block does not repeat the system text")
+end)
 
 -- ═══════════════════════ 11. GOAL UI ═══════════════════════
+
+local goalBox, goalScroll, planButton, phaseLabel, stopGoalButton
+local chipButtons = {}
+local FOCUS_IDS = { "bugs", "quality", "perf", "ideas", "polish" }
+
+local function hoverable(btn, base, hover)
+	btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hover end)
+	btn.MouseLeave:Connect(function() btn.BackgroundColor3 = base end)
+end
+local function button(text, parent, size, pos, onClick)
+	local b = mk("TextButton", { BackgroundColor3 = C.PANEL2, Size = size, Position = pos, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, Text = text, AutoButtonColor = false }, parent)
+	mk("UICorner", { CornerRadius = UDim.new(0, 4) }, b)
+	hoverable(b, C.PANEL2, C.ACCENT)
+	b.MouseButton1Click:Connect(onClick)
+	return b
+end
+local function card(title)
+	local f = mk("Frame", { BackgroundColor3 = C.PANEL, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = #goalScroll:GetChildren() }, goalScroll)
+	mk("UICorner", { CornerRadius = UDim.new(0, 6) }, f)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, f)
+	mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, f)
+	mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, Text = title, LayoutOrder = 0 }, f)
+	return f
+end
+local function label(parent, text, color, order)
+	return mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = color or C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, RichText = true, Text = escapeRich(text), LayoutOrder = order or 1 }, parent)
+end
+
+buildGoalView = function(root)
+	goalView = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -32), Position = UDim2.new(0, 0, 0, 32), Visible = false }, root)
+	goalBox = mk("TextBox", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(1, -16, 0, 60), Position = UDim2.new(0, 8, 0, 8), Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, MultiLine = true, ClearTextOnFocus = false, PlaceholderText = "Describe the goal… or leave empty and press Plan next", PlaceholderColor3 = C.MUTED, Text = "" }, goalView)
+	mk("UICorner", { CornerRadius = UDim.new(0, 4) }, goalBox)
+	local chips = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -16, 0, 22), Position = UDim2.new(0, 8, 0, 74) }, goalView)
+	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, chips)
+	local focus = S.get("goal_focus", DEFAULT_FOCUS)
+	for _, id in ipairs(FOCUS_IDS) do
+		local on = focus[id] == true
+		local b = mk("TextButton", { BackgroundColor3 = on and C.ACCENT or C.PANEL2, Size = UDim2.new(0, 66, 1, 0), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = C.TEXT, Text = FOCUS_LABELS[id], AutoButtonColor = false }, chips)
+		mk("UICorner", { CornerRadius = UDim.new(0, 4) }, b)
+		b.MouseEnter:Connect(function() b.BackgroundColor3 = C.ACCENT end)
+		b.MouseLeave:Connect(function()
+			local f2 = S.get("goal_focus", DEFAULT_FOCUS)
+			b.BackgroundColor3 = f2[id] and C.ACCENT or C.PANEL2
+		end)
+		b.MouseButton1Click:Connect(function()
+			local f = table.clone(S.get("goal_focus", DEFAULT_FOCUS))
+			f[id] = not f[id] or nil
+			S.set("goal_focus", f)
+			b.BackgroundColor3 = f[id] and C.ACCENT or C.PANEL2
+		end)
+		chipButtons[id] = b
+	end
+	local row = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -16, 0, 24), Position = UDim2.new(0, 8, 0, 102) }, goalView)
+	planButton = button("Plan next", row, UDim2.new(0, 90, 1, 0), UDim2.new(0, 0, 0, 0), function()
+		Agent.plan(goalBox.Text)
+	end)
+	goalBox:GetPropertyChangedSignal("Text"):Connect(function()
+		planButton.Text = (#goalBox.Text:gsub("%s", "") > 0) and "Plan" or "Plan next"
+	end)
+	stopGoalButton = button("Stop", row, UDim2.new(0, 50, 1, 0), UDim2.new(0, 96, 0, 0), function() Agent.stop() end)
+	stopGoalButton.Visible = false
+	phaseLabel = mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -160, 1, 0), Position = UDim2.new(0, 152, 0, 0), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = C.MUTED, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, Text = "idle" }, row)
+	goalScroll = mk("ScrollingFrame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -134), Position = UDim2.new(0, 0, 0, 132), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 6 }, goalView)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }, goalScroll)
+	mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8) }, goalScroll)
+end
+
+GoalUI.setPhase = function(phase, detail)
+	if not phaseLabel then return end
+	local r = Goal.requests
+	local counters = ("req G%d C%d O%d"):format(r.groq or 0, r.cerebras or 0, r.openrouter or 0)
+	phaseLabel.Text = phase:lower() .. (detail and (" · " .. detail) or "") .. " · " .. counters
+end
+GoalUI.setBusy = function(busy)
+	if planButton then planButton.Active = not busy; planButton.TextColor3 = busy and C.MUTED or C.TEXT end
+	if stopGoalButton then stopGoalButton.Visible = busy end
+end
+GoalUI.log = function(text, kind)
+	local color = kind == "error" and C.ERR or kind == "ok" and C.OK or kind == "muted" and C.MUTED or C.TEXT
+	if not goalScroll then return end
+	local logCard = goalScroll:FindFirstChild("ActLog") or card("Act log")
+	logCard.Name = "ActLog"
+	label(logCard, text, color, #logCard:GetChildren())
+end
+-- Blocking prompt: returns "allow" | "skip" | "stop". Runs in the calling coroutine (a batch, before its recording opens).
+GoalUI.prompt = function(kind, payload)
+	local answer = nil
+	local _, panel = openModalPanel(payload.title or kind)
+	local body = mk("ScrollingFrame", { BackgroundColor3 = C.CODEBG, Size = UDim2.new(1, -16, 1, -80), Position = UDim2.new(0, 8, 0, 34), AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarThickness = 6 }, panel)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, body)
+	for i, chunk in ipairs(chunkText(payload.text or "")) do
+		mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, RichText = true, Text = escapeRich(chunk), LayoutOrder = i }, body)
+	end
+	button("Allow", panel, UDim2.new(0, 80, 0, 26), UDim2.new(0, 8, 1, -34), function() answer = "allow" end)
+	button("Skip this call", panel, UDim2.new(0, 100, 0, 26), UDim2.new(0, 96, 1, -34), function() answer = "skip" end)
+	button("Stop plan", panel, UDim2.new(0, 80, 0, 26), UDim2.new(1, -88, 1, -34), function() answer = "stop" end)
+	while answer == nil and widgetAlive() do task.wait(0.05) end
+	closeModal()
+	return answer or "stop"
+end
+
+local RISK_COLOR = { low = C.OK, medium = Color3.fromHex("f59e0b"), high = C.ERR }
+local function showPlanCard(plan)
+	local old = goalScroll:FindFirstChild("PlanCard"); if old then old:Destroy() end
+	local f = card(plan.title); f.Name = "PlanCard"
+	label(f, plan.summary, C.TEXT, 1)
+	if #plan.verify_hint > 0 then label(f, "Verify: " .. plan.verify_hint, C.MUTED, 2) end
+	for i, s in ipairs(plan.steps) do
+		local row = mk("Frame", { BackgroundColor3 = C.PANEL2, Size = UDim2.new(1, 0, 0, 24), LayoutOrder = 10 + i }, f)
+		mk("UICorner", { CornerRadius = UDim.new(0, 4) }, row)
+		local box = mk("TextButton", { BackgroundColor3 = C.ACCENT, Size = UDim2.new(0, 16, 0, 16), Position = UDim2.new(0, 4, 0, 4), Text = "", AutoButtonColor = false }, row)
+		box.MouseEnter:Connect(function() box.BackgroundColor3 = C.ACCENT end)
+		box.MouseLeave:Connect(function() box.BackgroundColor3 = s.included and C.ACCENT or C.PANEL end)
+		box.MouseButton1Click:Connect(function()
+			s.included = not s.included
+			box.BackgroundColor3 = s.included and C.ACCENT or C.PANEL
+			local any = false
+			for _, st in ipairs(plan.steps) do any = any or st.included end
+			local ab = f:FindFirstChild("Approve", true)
+			if ab then ab.Active = any; ab.TextColor3 = any and C.TEXT or C.MUTED end
+		end)
+		mk("Frame", { BackgroundColor3 = RISK_COLOR[s.risk], Size = UDim2.new(0, 8, 0, 8), Position = UDim2.new(0, 26, 0, 8) }, row)
+		local t = mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -110, 1, 0), Position = UDim2.new(0, 40, 0, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.TEXT, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Text = ("%d. %s  [%s]  %s"):format(s.n, s.title, s.action, table.concat(s.targets, ", ")) }, row)
+		button("View", row, UDim2.new(0, 44, 0, 18), UDim2.new(1, -50, 0, 3), function()
+			GoalUI.prompt("detail", { title = ("Step %d"):format(s.n), text = s.detail .. "\n\nTargets:\n" .. table.concat(s.targets, "\n") })
+		end)
+	end
+	local bar = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 99 }, f)
+	local approve = button("Approve", bar, UDim2.new(0, 80, 1, 0), UDim2.new(0, 0, 0, 0), function()
+		if Goal.phase ~= "AWAITING_APPROVAL" then return end
+		goalBox.Text = ""
+		Agent.approve() -- Task 8
+	end)
+	approve.Name = "Approve"
+	button("Revise", bar, UDim2.new(0, 70, 1, 0), UDim2.new(0, 86, 0, 0), function()
+		local note = nil
+		local _, panel = openModalPanel("Revision note")
+		local box = mk("TextBox", { BackgroundColor3 = C.CODEBG, Size = UDim2.new(1, -16, 0, 80), Position = UDim2.new(0, 8, 0, 34), Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.TEXT, TextWrapped = true, MultiLine = true, ClearTextOnFocus = false, Text = "" }, panel)
+		button("Send", panel, UDim2.new(0, 70, 0, 26), UDim2.new(0, 8, 0, 122), function() note = box.Text end)
+		while note == nil and widgetAlive() do task.wait(0.05) end
+		closeModal()
+		if note and #note > 0 then Agent.revise(note) end
+	end)
+	button("Cancel", bar, UDim2.new(0, 70, 1, 0), UDim2.new(0, 162, 0, 0), function() f:Destroy(); Agent.cancel() end)
+end
+GoalUI.showCard = function(kind, data)
+	if kind == "plan" then showPlanCard(data) end
+end
 
 -- ═══════════════════════ 12. BOOTSTRAP ═══════════════════════
 
@@ -3032,6 +3454,12 @@ end
 plugin.Unloading:Connect(function()
 	unloaded = true
 	gen += 1
+	Goal.gen += 1
+	if Goal.verifyConn then Goal.verifyConn:Disconnect() end
+	if Goal.openRecording then
+		pcall(function() ChangeHistoryService:FinishRecording(Goal.openRecording.id, Enum.FinishRecordingOperation.Cancel) end)
+	end
+	Tools.clearRefs()
 end)
 
 trace("RoScript Pro loaded")
