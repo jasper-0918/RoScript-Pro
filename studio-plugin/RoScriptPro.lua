@@ -2268,7 +2268,8 @@ do
 	function Store.emptyTrash()
 		return Store.withRecording("empty trash", function()
 			for _, it in ipairs(Store.trashItems()) do
-				it:Destroy() -- the only Destroy of user content in the plugin; Jasper confirmed the modal
+				it:Destroy() -- the only Destroy of user content the MODEL can reach; Jasper confirmed the modal.
+				-- Store.applyCaps destroys too, but only to prune Trash/Plans past their caps (M11).
 			end
 		end)
 	end
@@ -2320,6 +2321,10 @@ end)
 -- ═══════════════════════ 9. TOOLS ═══════════════════════
 
 local Tools = { read = {}, write = {} }
+-- Forward-declared: two self-tests below reference Executor.isOffTarget/runWriteBatch, but
+-- Executor itself isn't built until section 10. Without this, those tests compile against a
+-- nil global and always FAIL (I2). Section 10 assigns into this same local, it does not redeclare it.
+local Executor
 local Refs = {} -- "#rN" -> Instance
 local RefOf = setmetatable({}, { __mode = "k" }) -- Instance -> "#rN"
 local refCounter = 0
@@ -3074,14 +3079,20 @@ local function requestWithWaits(convo, ps, tools)
 			ps.exhausted = true
 			return nil, "phase token ceiling reached"
 		end
-		-- Cerebras pacing: 5 RPM, no retry-after published.
+		-- Cerebras pacing: 5 RPM, no retry-after published. Wait only for the key that
+		-- will be free soonest; waiting on every recently-used key taxes turns that
+		-- never reach Cerebras at all.
+		local soonestGap, soonestIdx = nil, nil
 		for idx, at in pairs(lastCerebrasAt) do
 			local gap = CEREBRAS_MIN_GAP - (os.clock() - at)
-			if gap > 0 and gap < CEREBRAS_MIN_GAP then
-				say(("pacing Cerebras key #%d, %ds"):format(idx, math.ceil(gap)))
-				task.wait(gap)
-				if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
+			if gap > 0 and (not soonestGap or gap < soonestGap) then
+				soonestGap, soonestIdx = gap, idx
 			end
+		end
+		if soonestGap then
+			say(("pacing Cerebras key #%d, %ds"):format(soonestIdx, math.ceil(soonestGap)))
+			task.wait(soonestGap)
+			if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		end
 		local state = { failedModels = {}, failedProviders = {} }
 		local opts = { goal = true, tools = tools, temperature = GOAL_TEMPERATURE, estTokens = est, maxTokens = nil }
@@ -3129,7 +3140,7 @@ local function decodeArgs(call)
 	return args
 end
 
-local Executor = {}
+Executor = {} -- declared as a section-9 local (I2); this assigns into it, does not shadow it
 do
 	-- Only these three write tools change a script's source text; only they get a
 	-- "before" snapshot and a changed[] entry keyed by source hash. A set_props/move/
@@ -3157,7 +3168,7 @@ do
 			if inst and Executor.isOffTarget(inst, ps.step) then
 				reason = ("%s targets %s, which the approved step did not declare"):format(w.name, inst:GetFullName())
 			end
-			if w.name == "trash" then
+			if w.name == "trash" and type(w.args.targets) == "table" then
 				for _, t in ipairs(w.args.targets or {}) do
 					local i2 = Tools.resolve(t)
 					if i2 and (#i2:GetDescendants() > 0 or i2:IsA("LuaSourceContainer")) then reason = reason or ("trash %s (%d descendants)"):format(i2:GetFullName(), #i2:GetDescendants()) end
@@ -3201,11 +3212,31 @@ do
 			for _, w in ipairs(writes) do results[w.index] = { ok = false, error = msg, attributable = attributable } end
 			return results, false
 		end
-		if RunService:IsRunning() then return refuseAll("writes refused while a playtest is running", false) end
+		if RunService:IsRunning() then
+			-- Spec 11: wait out a playtest the user started mid-step, then retry this turn
+			-- once. Refusing immediately would burn the step's call budget for nothing.
+			GoalUI.log("playtest running; waiting for edit mode before writing", "muted")
+			local waited = 0
+			while RunService:IsRunning() and waited < 60 and Agent.checkGen(ps.myGen) do
+				task.wait(0.5)
+				waited += 0.5
+			end
+			if not Agent.checkGen(ps.myGen) then return refuseAll("stopped", false) end
+			if RunService:IsRunning() then
+				return refuseAll("writes refused while a playtest is running", false)
+			end
+		end
 		local step = ps.step
 		local ctx = { planId = Goal.planId, step = step, simulated = {} }
 		local skip = {}
-		for _, p in ipairs(preWalk(writes, ps, ctx)) do
+		-- preWalk runs outside any pcall of its own; a malformed tool call (e.g. a string
+		-- where trash's targets should be an array) would otherwise throw here and kill the
+		-- ACTING coroutine, leaving the phase stuck with the busy state on and no record (I3).
+		local okWalk, prompts = pcall(preWalk, writes, ps, ctx)
+		if not okWalk then
+			return refuseAll("could not prepare the batch: " .. tostring(prompts), false)
+		end
+		for _, p in ipairs(prompts) do
 			local answer = GoalUI.prompt("write", { title = p.reason, text = describe(p.write) })
 			if not Agent.checkGen(ps.myGen) then return refuseAll("stopped", false) end
 			if answer == "stop" then Agent.stop(); return refuseAll("stopped by Jasper", false)
@@ -3557,6 +3588,8 @@ function Agent.record(status)
 			end
 		end
 		table.sort(steps, function(x, y) return x.n < y.n end)
+		-- Goal.planId is nil'd at the top of every Agent.plan (C1), so a stale id from a
+		-- prior cycle can never reach here; the fallback below only ever mints a fresh one.
 		local record = {
 			v = 1, id = Goal.planId or Store.nextPlanId(Goal.plan and Goal.plan.title or "plan"),
 			status = status or deriveStatus(Goal.steps), createdAt = os.time(),
@@ -3713,12 +3746,21 @@ end
 function Agent.plan(goalText)
 	if Goal.phase ~= "IDLE" then return end
 	if RunService:IsRunning() then GoalUI.log("stop the playtest first", "error"); return end
+	-- Check for keys BEFORE creating the store (M10): a first run with no keys must not
+	-- dirty the place with an undoable-but-unwanted RoScriptPro folder.
+	if KeyStore.count() == 0 then
+		GoalUI.log("Add a free Groq, Cerebras or OpenRouter key in Settings first (Set button)", "error")
+		return
+	end
 	local root, err = Store.ensure()
 	if not root then GoalUI.log(err, "error"); return end
 	Goal.gen += 1
 	Goal.phase = "PLANNING"
 	Goal.goalText = goalText or ""
-	Goal.plan, Goal.revisions, Goal.steps, Goal.verify, Goal.models, Goal.estTokens = nil, {}, {}, nil, {}, 0
+	-- Reset all per-cycle state, planId included: without nilling it here, Cancel after a
+	-- completed cycle reuses the previous plan's id and Agent.record overwrites ITS folder
+	-- with steps = {}, permanently destroying that plan's Revert data (C1).
+	Goal.plan, Goal.revisions, Goal.steps, Goal.verify, Goal.models, Goal.estTokens, Goal.planId = nil, {}, {}, nil, {}, 0, nil
 	GoalUI.setBusy(true)
 	local instruction
 	if #Goal.goalText > 0 then
@@ -3797,6 +3839,14 @@ function Agent.cancel()
 end
 
 function Agent.stop()
+	if Goal.phase == "RECORDING" then
+		-- The record is already being written. Bumping gen here would orphan that
+		-- in-flight write: it would never finish, never set the phase back to IDLE,
+		-- and the cycle's Revert data would be lost. Let it settle — Agent.record
+		-- clears the phase and the busy state itself when it completes.
+		GoalUI.setPhase("RECORDING", "finishing")
+		return
+	end
 	Goal.gen += 1
 	local rec = Goal.openRecording
 	if rec and rec.owner ~= coroutine.running() then
@@ -3929,6 +3979,14 @@ end
 
 function Agent.approve()
 	if Goal.phase ~= "AWAITING_APPROVAL" or not Goal.plan then return end
+	local anyIncluded = false
+	for _, s in ipairs(Goal.plan.steps) do
+		anyIncluded = anyIncluded or s.included
+	end
+	if not anyIncluded then
+		GoalUI.log("nothing to do: every step is unticked", "muted")
+		return
+	end
 	Goal.gen += 1
 	Goal.phase = "ACTING"
 	Goal.planId = Store.nextPlanId(Goal.plan.title)
@@ -4116,9 +4174,11 @@ function Agent.repair()
 		Goal.estTokens += ps.used.tokens
 		local bookkeeping = Goal.steps[0]
 		Goal.steps[0] = nil -- a repair is never a plan step; never let it leak into steps[]
-		if not Agent.checkGen(myGen) then return end
+		-- Copy the bookkeeping out BEFORE the gen check: a Stop mid-repair must not lose
+		-- writes that already committed, or Revert would silently skip them (I5).
 		v.repair.changed, v.repair.undoLabels = bookkeeping.changed, bookkeeping.undoLabels
 		v.repair.beforeSources = bookkeeping.beforeSources
+		if not Agent.checkGen(myGen) then return end
 		if not ok then v.repair.outcome = "repair failed: " .. tostring(why) end
 		-- Executor already labels a step.n == 0 batch "Repair" (see runWriteBatch), so
 		-- undoLabels read "RoScript Pro: Repair, part k" directly; no relabel needed here.
@@ -4218,6 +4278,7 @@ SelfTest.case("record: revert restores untouched scripts and skips edited ones",
 	withScratch(function(f)
 		local a = Instance.new("Script"); a.Name = "A"; a.Source = "print('after A')"; a.Parent = f
 		local b = Instance.new("Script"); b.Name = "B"; b.Source = "print('after B, then hand edit')"; b.Parent = f
+		local had = Store.root() ~= nil
 		local root = assert(Store.ensure())
 		local rec = { v = 1, id = "Plan_900_revert-test", status = "done", createdAt = os.time(), goal = "g", summary = "s", steps = {
 			{ n = 1, status = "done", changed = {
@@ -4228,7 +4289,15 @@ SelfTest.case("record: revert restores untouched scripts and skips edited ones",
 		local ok, report = Agent.revertPlan("Plan_900_revert-test")
 		assert(ok and #report.restored == 1 and #report.skipped == 1, ("restored %d skipped %d"):format(#report.restored, #report.skipped))
 		assert(a.Source == "print('before A')" and b.Source:find("hand edit", 1, true), "A reverted, B skipped")
-		root.Plans["Plan_900_revert-test"]:Destroy()
+		-- Leaving the store root behind (when this test is the one that created it) makes
+		-- "store: ensure + plan write/read/list" spuriously FAIL on the next run, since that
+		-- test asserts no store exists yet (M17). Only destroy the whole root if we created
+		-- it here; a store that already existed keeps its narrower per-plan cleanup.
+		if had then
+			root.Plans["Plan_900_revert-test"]:Destroy()
+		else
+			root:Destroy()
+		end
 	end)
 end)
 SelfTest.case("verify: history capture honours the boundary and the ring", function()
@@ -4460,6 +4529,7 @@ end
 
 local function showResultCard(rec)
 	local old = goalScroll:FindFirstChild("ResultCard"); if old then old:Destroy() end
+	local stale = goalScroll:FindFirstChild("VerifyCard"); if stale then stale:Destroy() end
 	local f = card(("%s · %s"):format(rec.id, rec.status)); f.Name = "ResultCard"
 	local done, total = 0, 0
 	for _, st in ipairs(rec.steps or {}) do total += 1; if st.status == "done" then done += 1 end end
