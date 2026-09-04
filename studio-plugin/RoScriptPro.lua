@@ -45,61 +45,106 @@ local PROV = {
 }
 local PROV_ORDER = { "groq", "cerebras", "openrouter" }
 
--- Fixed failover order. Dead slugs classify as model-error and fail over, so the
--- chain is data: delete lines as providers deprecate. zai-glm-4.7 and
--- nemotron-3-super are PROVISIONAL (reasoning-family, no effort control) — cut
--- them if spike 4 shows hidden-reasoning wall-clock burn.
+-- Fixed failover order. Dead slugs classify as model-error and fail over, so
+-- the chain is data: delete lines as providers deprecate. Re-verified
+-- 2026-09-04 against OpenRouter's live model list and spike S5. Every free
+-- OpenRouter slug v2 shipped with had been retired (gpt-oss-120b:free,
+-- gpt-oss-20b:free, llama-3.3-70b-instruct:free), and because failedModels is
+-- per-REQUEST state a dead entry costs a wasted call on every request, not one
+-- per session. Keep this list live or it silently taxes each turn.
 local MODEL_CHAIN = {
+	-- S5: tool calls confirmed. Arguments arrive as a JSON string, and only one
+	-- call comes back even with parallel_tool_calls set.
 	{ p = "groq", m = "openai/gpt-oss-120b", tools = true },
 	{ p = "groq", m = "openai/gpt-oss-20b", tools = true },
+	-- Cerebras answered 402 "payment required" on 2026-09-04. The billing branch
+	-- in classifyFailure retires the key after ONE attempt per session, and this
+	-- entry starts working again on its own if the account ever does.
 	{ p = "cerebras", m = "gpt-oss-120b", tools = true },
-	{ p = "cerebras", m = "zai-glm-4.7", tools = false }, -- absent from Cerebras docs 2026-09-03
-	{ p = "openrouter", m = "openai/gpt-oss-120b:free", tools = true }, -- S5: endpoints may be empty
-	{ p = "openrouter", m = "openai/gpt-oss-20b:free", tools = true },
-	{ p = "openrouter", m = "nvidia/nemotron-3-super-120b-a12b:free", tools = false },
-	{ p = "openrouter", m = "meta-llama/llama-3.3-70b-instruct:free", tools = false },
+	-- All four present, free and tool-capable in OpenRouter's list on 2026-09-04.
+	-- Ordered for agentic code work; none is verified against our tool schema yet.
+	{ p = "openrouter", m = "z-ai/glm-5.2:free", tools = true },
+	{ p = "openrouter", m = "nvidia/nemotron-3-super-120b-a12b:free", tools = true },
+	{ p = "openrouter", m = "cohere/north-mini-code:free", tools = true },
+	{ p = "openrouter", m = "poolside/laguna-s-2.1:free", tools = true },
 }
 
 -- Output budgets sized to the undocumented (only-shortenable) HttpService
 -- timeout: fast tiers get more room. Spike 4 finalizes.
 local MAXTOK = { groq = 4096, cerebras = 8192, openrouter = 2048 }
 
--- OpenRouter attribution headers (their API asks for these; harmless elsewhere).
-local OR_REFERER = "https://github.com/jasper-0918/RoScript-Pro"
-local OR_TITLE = "RoScript Pro"
+-- ─── Tunables ───────────────────────────────────────────────────────────────
+-- One table rather than ~40 separate locals, and not a style choice: Luau caps
+-- every function at 200 local registers and this whole file compiles as ONE
+-- chunk, so column-0 `local`s are a budget. v2 shipped 206 of them and would
+-- not compile at all. Table fields cost no register — add tunables HERE, and
+-- run tools/check-main-chunk-locals.py before shipping if you add column-0
+-- locals elsewhere.
+local CFG = {
+	-- OpenRouter attribution headers (their API asks for these; harmless elsewhere).
+	OR_REFERER = "https://github.com/jasper-0918/RoScript-Pro",
+	OR_TITLE = "RoScript Pro",
 
--- History is quota-driven, not timeout-driven: free tiers meter tokens/min+day,
--- so a small history roughly doubles session length per key.
-local HISTORY_MAX_MSGS = 12
-local HISTORY_MAX_CHARS = 15000
+	-- History is quota-driven, not timeout-driven: free tiers meter tokens/min+day,
+	-- so a small history roughly doubles session length per key.
+	HISTORY_MAX_MSGS = 12,
+	HISTORY_MAX_CHARS = 15000,
 
--- Context caps. CTX_MAX deliberately exceeds SEL_MAX + SCRIPT_MAX + overhead;
--- if the assembled block still exceeds it, the script tail is trimmed first.
-local SEL_MAX = 2000
-local SCRIPT_MAX = 8000
-local SCRIPT_HEAD = 6000
-local SCRIPT_TAIL = 2000
-local CTX_MAX = 11000
+	-- Context caps. CTX_MAX deliberately exceeds SEL_MAX + SCRIPT_MAX + overhead;
+	-- if the assembled block still exceeds it, the script tail is trimmed first.
+	SEL_MAX = 2000,
+	SCRIPT_MAX = 8000,
+	SCRIPT_HEAD = 6000,
+	SCRIPT_TAIL = 2000,
+	CTX_MAX = 11000,
 
-local LABEL_MAX = 16000 -- chars per TextLabel; longer runs are split
+	LABEL_MAX = 16000, -- chars per TextLabel; longer runs are split
 
--- Run engine: "loadstring" or "module" (ModuleScript + require fallback).
--- Spike 2 ran 2026-09-03 on this machine: BOTH passed; loadstring ships per
--- the spec tie-break (no DataModel churn, no module cache).
-local RUN_ENGINE = "loadstring"
+	-- Run engine: "loadstring" or "module" (ModuleScript + require fallback).
+	-- Spike 2 ran 2026-09-03 on this machine: BOTH passed; loadstring ships per
+	-- the spec tie-break (no DataModel churn, no module cache).
+	RUN_ENGINE = "loadstring",
 
--- ─── Goal Mode (v2) constants — spec §4–§6, do not tune without re-reading ───
-local STORE_VERSION = 1
-local MEMORY_MAX, FACTS_MAX, NOTES_MAX, SUMMARY_MAX = 6000, 2500, 3500, 2000
-local CHUNK_MAX = 100000 -- S4 confirms; documented StringValue cap is 200,000
-local PLANS_FED_TO_PLAN, PLANS_KEEP, TRASH_KEEP, TRASH_DAYS = 3, 20, 25, 14
-local INDEX_MAX_ENTRIES, READ_SCRIPT_MAX, SEARCH_MAX_HITS, OUTPUT_MAX_CHARS = 200, 8000, 40, 4000
-local STEP_SEED_MAX, WRITES_MAX_CHARS = 24000, 4000
-local MAX_STEPS, MAX_CONSECUTIVE_TOOL_ERRORS = 10, 3
-local GROQ_REQ_MAX = 3500 -- S6 sets: 8000 - GOAL_MAXTOK.groq if max_tokens counts, else 7000
-local BIG_REQ_MAX = 28000 -- Cerebras 30K TPM
-local GOAL_WAIT_MAX, GOAL_WAITS_PER_REQUEST, CEREBRAS_MIN_GAP = 90, 2, 12
-local GOAL_TEMPERATURE = 0.2
+	-- ─── Goal Mode (v2) — spec §4–§6, do not tune without re-reading ───
+	STORE_VERSION = 1,
+	-- Combined content budget for Memory. FACTS_MAX + NOTES_MAX must fit inside
+	-- it (the 13-char SEP separator is stored on top and not counted); a
+	-- self-test enforces that, so raising a sub-cap alone fails loudly.
+	MEMORY_MAX = 6000,
+	FACTS_MAX = 2500,
+	NOTES_MAX = 3500,
+	SUMMARY_MAX = 2000,
+	-- S4 ran 2026-09-04: 100,000 AND 150,000 both round-tripped through a
+	-- StringValue. Documented cap is 200,000; 100,000 keeps a 2x margin.
+	CHUNK_MAX = 100000,
+	PLANS_FED_TO_PLAN = 3,
+	PLANS_KEEP = 20,
+	TRASH_KEEP = 25,
+	TRASH_DAYS = 14,
+	INDEX_MAX_ENTRIES = 200,
+	READ_SCRIPT_MAX = 8000,
+	SEARCH_MAX_HITS = 40,
+	OUTPUT_MAX_CHARS = 4000,
+	STEP_SEED_MAX = 24000,
+	WRITES_MAX_CHARS = 4000,
+	MAX_STEPS = 10,
+	MAX_CONSECUTIVE_TOOL_ERRORS = 3,
+	-- S6 ran 2026-09-04: a 45,000-char prompt (~10,000 tokens) sent with
+	-- max_tokens=4096 came back "Limit 8000, Requested 10115". 10,115 is the
+	-- prompt alone, so max_tokens does NOT count toward the per-request TPM
+	-- check -- the spec's 7000 branch, not 8000 - GOAL_MAXTOK.groq.
+	-- The completion still SPENDS TPM afterwards, so two large requests inside
+	-- one minute can still 429; cooling handles that, this cap does not.
+	GROQ_REQ_MAX = 7000,
+	BIG_REQ_MAX = 28000, -- Cerebras 30K TPM
+	GOAL_WAIT_MAX = 90,
+	GOAL_WAITS_PER_REQUEST = 2,
+	CEREBRAS_MIN_GAP = 12,
+	GOAL_TEMPERATURE = 0.2,
+
+	COOLDOWN_DEFAULT = 30, -- seconds, when no Retry-After is readable
+	COOLDOWN_NETFAIL = 15,
+}
 local GOAL_MAXTOK = { groq = 4096, cerebras = 8192, openrouter = 8192 }
 local BUDGETS = {
 	normal = { plan = 12, revise = 6, act = 8, repair = 6, repairPasses = 1, tokens = 150000 },
@@ -136,9 +181,6 @@ local Goal = {
 	openRecording = nil, -- { id, owner = coroutine }
 	stepConvo = nil,
 }
-
-local COOLDOWN_DEFAULT = 30 -- seconds, when no Retry-After is readable
-local COOLDOWN_NETFAIL = 15
 
 -- UI hooks, forward-declared so PROVIDER/APPLY code (defined before the UI
 -- section) can surface status without forward references. Filled in section 7.
@@ -503,7 +545,7 @@ local function buildSelectionSummary()
 			table.insert(out, line)
 		end
 	end
-	return utf8Trim(table.concat(out, "\n"), SEL_MAX), #selected
+	return utf8Trim(table.concat(out, "\n"), CFG.SEL_MAX), #selected
 end
 
 local function getActiveScriptBlock()
@@ -519,12 +561,12 @@ local function getActiveScriptBlock()
 	end
 	local _, lines = src:gsub("\n", "")
 	local header = string.format("Active script: %s (%s, %d lines)", active:GetFullName(), active.ClassName, lines + 1)
-	if #src > SCRIPT_MAX then
-		local head = utf8Trim(src, SCRIPT_HEAD)
+	if #src > CFG.SCRIPT_MAX then
+		local head = utf8Trim(src, CFG.SCRIPT_HEAD)
 		-- Snap the tail cut to the START of the char containing the cut byte,
 		-- and slice FROM it: the tail runs a few bytes long at most and is
 		-- always valid UTF-8 (slicing from boundary+1 would begin mid-char).
-		local i = #src - SCRIPT_TAIL + 1
+		local i = #src - CFG.SCRIPT_TAIL + 1
 		local b = utf8.offset(src, 0, math.min(i, #src)) or i
 		local tail = src:sub(b)
 		src = head .. "\n-- [... middle truncated by RoScript Pro ...]\n" .. tail
@@ -555,8 +597,8 @@ local function buildContext()
 	local block = table.concat(parts, "\n")
 
 	-- Enforce the whole-block cap by trimming the script tail first.
-	if #block > CTX_MAX and scriptSrc then
-		local overflow = #block - CTX_MAX
+	if #block > CFG.CTX_MAX and scriptSrc then
+		local overflow = #block - CFG.CTX_MAX
 		scriptSrc = utf8Trim(scriptSrc, math.max(#scriptSrc - overflow - 40, 0))
 			.. "\n-- [... trimmed to context cap ...]"
 		parts = { "=== STUDIO CONTEXT BEGIN ===" }
@@ -568,7 +610,7 @@ local function buildContext()
 		table.insert(parts, "=== STUDIO CONTEXT END ===")
 		block = table.concat(parts, "\n")
 	end
-	block = utf8Trim(block, CTX_MAX + 200) -- absolute backstop
+	block = utf8Trim(block, CFG.CTX_MAX + 200) -- absolute backstop
 
 	local capParts = {}
 	if selCount and selCount > 0 then
@@ -645,6 +687,11 @@ local PAT_TOOLARGE = { "request too large", "body is too large", "context_length
 local PAT_PERMISSION = { "not allowed", "permission", "denied" }
 local PAT_REFUSAL = { "i can'?t", "i cannot", "i'm sorry", "i am unable", "cannot assist" }
 
+-- Payment/credit exhaustion. Deliberately NOT matching the bare word "billing":
+-- Groq's 413 body links to console.groq.com/settings/billing, and a request that
+-- is merely too large must never be read as a dead account.
+local PAT_BILLING = { "payment required", "payment_required", "insufficient.credits", "insufficient_quota" }
+
 local function looksLikeRefusal(text)
 	return #text < 400 and not text:find("```", 1, true) and matchAny(text, PAT_REFUSAL)
 end
@@ -674,7 +721,7 @@ local function classifyFailure(entry, code, bodyText, headers, pcallErr, state)
 	local pname = PROV[entry.p].name
 
 	if pcallErr then
-		Cooling[id] = os.clock() + COOLDOWN_NETFAIL
+		Cooling[id] = os.clock() + CFG.COOLDOWN_NETFAIL
 		if matchAny(pcallErr, PAT_PERMISSION) then
 			return pname .. ": Studio blocked the request — check Plugin Management permissions", "next"
 		end
@@ -691,8 +738,15 @@ local function classifyFailure(entry, code, bodyText, headers, pcallErr, state)
 		state.lastCode = code
 		return pname .. ": model produced a malformed tool call, retrying", "retry-same"
 	end
+	-- Billing BEFORE rate-limit: Cerebras' 402 body carries "param":"quota" and
+	-- PAT_RATELIMIT matches "quota", so a dead account otherwise read as a
+	-- 30-second cooldown and was retried forever (seen live 2026-09-04).
+	if code == 402 or matchAny(bodyText, PAT_BILLING) then
+		Bad[id] = true
+		return pname .. " key #" .. entry.idx .. ": billing required, skipped this session", "next"
+	end
 	if code == 429 or matchAny(bodyText, PAT_RATELIMIT) then
-		Cooling[id] = os.clock() + (retryAfterSeconds(headers, bodyText) or COOLDOWN_DEFAULT)
+		Cooling[id] = os.clock() + (retryAfterSeconds(headers, bodyText) or CFG.COOLDOWN_DEFAULT)
 		return pname .. " key #" .. entry.idx .. " cooling", "next"
 	end
 	if code == 401 or code == 403 or matchAny(bodyText, PAT_AUTH) then
@@ -719,8 +773,8 @@ local function callProvider(entry, messages, opts)
 		["Authorization"] = "Bearer " .. entry.key,
 	}
 	if entry.p == "openrouter" then
-		headers["HTTP-Referer"] = OR_REFERER
-		headers["X-Title"] = OR_TITLE
+		headers["HTTP-Referer"] = CFG.OR_REFERER
+		headers["X-Title"] = CFG.OR_TITLE
 	end
 	local body = {
 		model = entry.m,
@@ -831,7 +885,7 @@ local function chatOnce(messages, state, statusFn, opts)
 		local otherSkip = state.failedModels[entry.p .. ":" .. entry.m]
 			or state.failedProviders[entry.p]
 			or not isAvailable(entry)
-		local sizeSkip = opts.estTokens and entry.p == "groq" and opts.estTokens > GROQ_REQ_MAX
+		local sizeSkip = opts.estTokens and entry.p == "groq" and opts.estTokens > CFG.GROQ_REQ_MAX
 		local skip = otherSkip or sizeSkip
 		if sizeSkip and not otherSkip then
 			sizeSkipped += 1
@@ -1040,7 +1094,7 @@ local function runOnce(code)
 	end
 
 	local fn, compileErr
-	if RUN_ENGINE == "loadstring" then
+	if CFG.RUN_ENGINE == "loadstring" then
 		-- loadstring returns nil, errmsg on syntax errors: capture BOTH.
 		local f, e
 		local okLS = pcall(function()
@@ -1161,13 +1215,13 @@ end
 
 -- Split long runs at newline boundaries so no label exceeds LABEL_MAX.
 local function chunkText(s)
-	if #s <= LABEL_MAX then
+	if #s <= CFG.LABEL_MAX then
 		return { s }
 	end
 	local chunks = {}
 	local pos = 1
 	while pos <= #s do
-		local last = math.min(pos + LABEL_MAX - 1, #s)
+		local last = math.min(pos + CFG.LABEL_MAX - 1, #s)
 		if last < #s then
 			local nl = s:sub(pos, last):find("\n[^\n]*$")
 			if nl and nl > 1 then
@@ -1998,6 +2052,24 @@ SelfTest.case("provider: 413 classifies as too-large before rate-limit", functio
 	assert(action == "next" and state.failedProviders.groq == true, "413 must mark provider too-large, got " .. tostring(reason))
 	assert(Cooling["groq:1"] == nil, "413 must not cool the key")
 end)
+SelfTest.case("provider: 402 is billing, not a rate-limit cooldown", function()
+	Cooling["cerebras:1"], Bad["cerebras:1"] = nil, nil
+	local state = { failedModels = {}, failedProviders = {} }
+	local entry = { p = "cerebras", m = "gpt-oss-120b", key = "k", idx = 1 }
+	local reason, action = classifyFailure(entry, 402, '{"message":"Payment required to access this resource. Visit your billing tab.","type":"payment_required_error","param":"quota","code":"payment_required"}', {}, nil, state)
+	assert(action == "next", "got " .. tostring(action))
+	assert(Bad["cerebras:1"] == true, "402 must retire the key for the session: " .. tostring(reason))
+	assert(Cooling["cerebras:1"] == nil, "402 must not be treated as a cooldown")
+	Bad["cerebras:1"] = nil
+end)
+SelfTest.case("provider: a 413 that links to a billing page stays too-large", function()
+	Cooling["groq:1"], Bad["groq:1"] = nil, nil
+	local state = { failedModels = {}, failedProviders = {} }
+	local entry = { p = "groq", m = "openai/gpt-oss-120b", key = "k", idx = 1 }
+	local _, action = classifyFailure(entry, 413, '{"error":{"message":"Request too large ... Upgrade to Dev Tier today at https://console.groq.com/settings/billing","code":"rate_limit_exceeded"}}', {}, nil, state)
+	assert(action == "next" and state.failedProviders.groq == true, "413 must stay too-large")
+	assert(Bad["groq:1"] == nil, "413 must not retire the key as a billing failure")
+end)
 SelfTest.case("provider: tool_use_failed asks for a same-entry retry", function()
 	local state = { failedModels = {}, failedProviders = {} }
 	local entry = { p = "groq", m = "openai/gpt-oss-120b", key = "k", idx = 2 }
@@ -2070,13 +2142,13 @@ do
 		local root = Store.root()
 		if root then
 			local v = root:GetAttribute("RSP_StoreVersion")
-			if v ~= STORE_VERSION then
-				return nil, ("store version %s found, this plugin expects %d; Goal Mode refuses to start"):format(tostring(v), STORE_VERSION)
+			if v ~= CFG.STORE_VERSION then
+				return nil, ("store version %s found, this plugin expects %d; Goal Mode refuses to start"):format(tostring(v), CFG.STORE_VERSION)
 			end
 		else
 			root = Instance.new("Folder")
 			root.Name = ROOT_NAME
-			root:SetAttribute("RSP_StoreVersion", STORE_VERSION)
+			root:SetAttribute("RSP_StoreVersion", CFG.STORE_VERSION)
 			root.Parent = ServerStorage
 		end
 		child(root, "Memory"); child(root, "Manifest"); child(root, "Plans"); child(root, "Trash")
@@ -2102,8 +2174,8 @@ do
 		repeat
 			n += 1
 			local c = child(folder, "chunk_" .. n, "StringValue")
-			c.Value = text:sub(pos, pos + CHUNK_MAX - 1)
-			pos += CHUNK_MAX
+			c.Value = text:sub(pos, pos + CFG.CHUNK_MAX - 1)
+			pos += CFG.CHUNK_MAX
 		until pos > #text
 		local k = n + 1
 		while true do
@@ -2129,7 +2201,7 @@ do
 		if not root then
 			error(err)
 		end
-		Store.writeText(root.Memory, utf8Trim(facts, FACTS_MAX) .. SEP .. utf8Trim(notes, NOTES_MAX))
+		Store.writeText(root.Memory, utf8Trim(facts, CFG.FACTS_MAX) .. SEP .. utf8Trim(notes, CFG.NOTES_MAX))
 	end
 
 	function Store.readManifest()
@@ -2211,15 +2283,15 @@ do
 		if not root then return end
 		local plans = root.Plans:GetChildren()
 		table.sort(plans, function(a, b) return (a:GetAttribute("RSP_CreatedAt") or 0) > (b:GetAttribute("RSP_CreatedAt") or 0) end)
-		for i = PLANS_KEEP + 1, #plans do
+		for i = CFG.PLANS_KEEP + 1, #plans do
 			plans[i]:Destroy()
 			GoalUI.log("pruned old record " .. plans[i].Name, "muted")
 		end
 		local items = root.Trash:GetChildren()
 		table.sort(items, function(a, b) return (a:GetAttribute("RSP_TrashedAt") or 0) > (b:GetAttribute("RSP_TrashedAt") or 0) end)
-		local cutoff = os.time() - TRASH_DAYS * 86400
+		local cutoff = os.time() - CFG.TRASH_DAYS * 86400
 		for i, it in ipairs(items) do
-			if i > TRASH_KEEP or (it:GetAttribute("RSP_TrashedAt") or 0) < cutoff then
+			if i > CFG.TRASH_KEEP or (it:GetAttribute("RSP_TrashedAt") or 0) < cutoff then
 				GoalUI.log("emptied old trash item " .. it.Name, "muted")
 				it:Destroy()
 			end
@@ -2282,7 +2354,7 @@ SelfTest.case("store: fnv1a known vectors", function()
 end)
 SelfTest.case("store: chunk round trip past CHUNK_MAX", function()
 	withScratch(function(f)
-		local text = string.rep("y", CHUNK_MAX + 17)
+		local text = string.rep("y", CFG.CHUNK_MAX + 17)
 		Store.writeText(f, text)
 		assert(#f:GetChildren() == 2, "two chunks, got " .. #f:GetChildren())
 		assert(Store.readText(f) == text, "round trip")
@@ -2471,7 +2543,7 @@ do
 		local function walk(inst, d, indent)
 			for _, ch in ipairs(inst:GetChildren()) do
 				if not SKIP_INDEX[ch.ClassName] and not SKIP_INDEX[ch.Name] then
-					if count >= INDEX_MAX_ENTRIES then
+					if count >= CFG.INDEX_MAX_ENTRIES then
 						truncated += 1
 					else
 						count += 1
@@ -2526,7 +2598,7 @@ do
 		for i = from, to do
 			local line = ("%d\t%s"):format(i, all[i])
 			chars += #line + 1
-			if chars > READ_SCRIPT_MAX then
+			if chars > CFG.READ_SCRIPT_MAX then
 				table.insert(out, ("… cut at line %d; call again with fromLine=%d"):format(i, i))
 				break
 			end
@@ -2556,7 +2628,7 @@ do
 					end
 					if found then
 						table.insert(hits, ("%s:%d: %s"):format(path, i, utf8Trim(line, 160)))
-						if #hits >= SEARCH_MAX_HITS then
+						if #hits >= CFG.SEARCH_MAX_HITS then
 							return { ok = true, hits = hits, truncated = true }
 						end
 					end
@@ -2575,7 +2647,7 @@ do
 			if e.messageType == Enum.MessageType.MessageError or e.messageType == Enum.MessageType.MessageWarning then
 				local line = ("[%s] %s"):format(e.messageType.Name:gsub("Message", ""), utf8Trim(tostring(e.message), 200))
 				chars += #line
-				if chars > OUTPUT_MAX_CHARS or #out >= count then break end
+				if chars > CFG.OUTPUT_MAX_CHARS or #out >= count then break end
 				table.insert(out, line)
 			end
 		end
@@ -2627,12 +2699,12 @@ SelfTest.case("tools: value codec", function()
 end)
 SelfTest.case("tools: index caps and labels", function()
 	withScratch(function(f)
-		for i = 1, INDEX_MAX_ENTRIES + 5 do
+		for i = 1, CFG.INDEX_MAX_ENTRIES + 5 do
 			local p = Instance.new("Folder"); p.Name = "F" .. i; p.Parent = f
 		end
 		local r = Tools.read.index({ path = "ServerStorage.RSP_TestScratch", depth = 1 })
 		assert(r.ok and r.truncated == 5, "truncated count " .. tostring(r.truncated))
-		assert(select(2, r.text:gsub("\n", "")) >= INDEX_MAX_ENTRIES - 1, "line count")
+		assert(select(2, r.text:gsub("\n", "")) >= CFG.INDEX_MAX_ENTRIES - 1, "line count")
 	end)
 end)
 SelfTest.case("tools: search plain vs pattern", function()
@@ -3038,7 +3110,7 @@ end
 local function compactConvo(convo, tools)
 	local changed = false
 	local ELIDED = "[result elided; call the tool again if needed]"
-	while estimateTokens(convo.messages, tools, nil) > BIG_REQ_MAX do
+	while estimateTokens(convo.messages, tools, nil) > CFG.BIG_REQ_MAX do
 		local victim
 		for _, m in ipairs(convo.messages) do
 			if m.role == "tool" and m.content ~= ELIDED then victim = m; break end
@@ -3070,10 +3142,10 @@ local function requestWithWaits(convo, ps, tools)
 	while true do
 		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		local est = estimateTokens(convo.messages, tools, convo.lastUsage)
-		if est > BIG_REQ_MAX then
+		if est > CFG.BIG_REQ_MAX then
 			compactConvo(convo, tools)
 			est = estimateTokens(convo.messages, tools, nil)
-			if est > BIG_REQ_MAX then return nil, "context too large for the free tiers" end
+			if est > CFG.BIG_REQ_MAX then return nil, "context too large for the free tiers" end
 		end
 		if ps.used.tokens + est > ps.budget.tokens then
 			ps.exhausted = true
@@ -3084,7 +3156,7 @@ local function requestWithWaits(convo, ps, tools)
 		-- never reach Cerebras at all.
 		local soonestGap, soonestIdx = nil, nil
 		for idx, at in pairs(lastCerebrasAt) do
-			local gap = CEREBRAS_MIN_GAP - (os.clock() - at)
+			local gap = CFG.CEREBRAS_MIN_GAP - (os.clock() - at)
 			if gap > 0 and (not soonestGap or gap < soonestGap) then
 				soonestGap, soonestIdx = gap, idx
 			end
@@ -3095,7 +3167,7 @@ local function requestWithWaits(convo, ps, tools)
 			if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		end
 		local state = { failedModels = {}, failedProviders = {} }
-		local opts = { goal = true, tools = tools, temperature = GOAL_TEMPERATURE, estTokens = est, maxTokens = nil }
+		local opts = { goal = true, tools = tools, temperature = CFG.GOAL_TEMPERATURE, estTokens = est, maxTokens = nil }
 		local result, err = chatOnce(convo.messages, state, say, opts)
 		if not Agent.checkGen(ps.myGen) then return nil, "stopped" end
 		if result then
@@ -3121,7 +3193,7 @@ local function requestWithWaits(convo, ps, tools)
 				if dt > 0 and (not soonest or dt < soonest) then soonest = dt end
 			end
 		end
-		if soonest and soonest <= GOAL_WAIT_MAX and waits < GOAL_WAITS_PER_REQUEST then
+		if soonest and soonest <= CFG.GOAL_WAIT_MAX and waits < CFG.GOAL_WAITS_PER_REQUEST then
 			waits += 1
 			say(("waiting %ds for a key to cool"):format(math.ceil(soonest)))
 			task.wait(soonest + 1)
@@ -3420,7 +3492,7 @@ local function buildGoalUserBlock(phaseInstruction)
 	table.insert(parts, "=== MEMORY: NOTES ===\n" .. (notes ~= "" and notes or "(none yet)"))
 	local page = Store.listPlans(0)
 	local summaries = {}
-	for i = 1, math.min(PLANS_FED_TO_PLAN, #page) do
+	for i = 1, math.min(CFG.PLANS_FED_TO_PLAN, #page) do
 		local rec = Store.readPlan(page[i].id)
 		if rec then
 			local s = ("%s [%s] %s"):format(rec.id, rec.status, rec.summary or "")
@@ -3456,7 +3528,7 @@ local RISKS = { low = true, medium = true, high = true }
 local function validatePlan(obj)
 	if type(obj) ~= "table" or type(obj.steps) ~= "table" then return nil, "plan must have steps" end
 	if #obj.steps == 0 then return nil, "plan has no steps" end
-	if #obj.steps > MAX_STEPS then return nil, ("at most %d steps, got %d"):format(MAX_STEPS, #obj.steps) end
+	if #obj.steps > CFG.MAX_STEPS then return nil, ("at most %d steps, got %d"):format(CFG.MAX_STEPS, #obj.steps) end
 	local plan = { title = utf8Trim(tostring(obj.title or "Untitled"), 80), summary = utf8Trim(tostring(obj.summary or ""), 600), verify_hint = utf8Trim(tostring(obj.verify_hint or ""), 200), steps = {} }
 	for i, s in ipairs(obj.steps) do
 		if type(s) ~= "table" then return nil, "step " .. i .. " is not an object" end
@@ -3489,7 +3561,7 @@ local function runPhaseLoop(convo, ps, tools, controlName, onControl)
 	while true do
 		if not Agent.checkGen(ps.myGen) then return false, "stopped" end
 		if ps.exhausted then return false, "budget" end
-		if ps.consecutiveErrors >= MAX_CONSECUTIVE_TOOL_ERRORS then return false, "three consecutive tool errors" end
+		if ps.consecutiveErrors >= CFG.MAX_CONSECUTIVE_TOOL_ERRORS then return false, "three consecutive tool errors" end
 		ps.turns += 1
 		if ps.turns > maxTurns then return false, "too many model turns" end
 		local result, err = requestWithWaits(convo, ps, tools)
@@ -3551,7 +3623,7 @@ local function buildFacts()
 	local ids = {}
 	for i = 1, math.min(3, #page) do table.insert(ids, page[i].id .. " (" .. page[i].status .. ")") end
 	table.insert(lines, "Recent plans: " .. (#ids > 0 and table.concat(ids, ", ") or "none"))
-	return utf8Trim(table.concat(lines, "\n"), FACTS_MAX)
+	return utf8Trim(table.concat(lines, "\n"), CFG.FACTS_MAX)
 end
 
 local function deriveStatus(steps)
@@ -3599,7 +3671,7 @@ function Agent.record(status)
 		}
 		-- trim writes[] per step to WRITES_MAX_CHARS
 		for _, st in ipairs(record.steps) do
-			while #HttpService:JSONEncode(st.writes or {}) > WRITES_MAX_CHARS and #st.writes > 0 do
+			while #HttpService:JSONEncode(st.writes or {}) > CFG.WRITES_MAX_CHARS and #st.writes > 0 do
 				local w = st.writes[#st.writes]
 				if w.replace and #w.replace > 40 then w.replace = utf8Trim(w.replace, 40) elseif w.find and #w.find > 40 then w.find = utf8Trim(w.find, 40) else table.remove(st.writes) end
 			end
@@ -3608,12 +3680,12 @@ function Agent.record(status)
 		local _, oldNotes = Store.readMemory()
 		local newNotes, summary = oldNotes, record.summary
 		if status ~= "cancelled" and Goal.plan then
-			local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = ("=== MEMORY: FACTS ===\n%s\n\n=== MEMORY: NOTES (current) ===\n%s\n\n=== RECORD ===\n%s\n\n=== PHASE ===\nRewrite Notes (≤ %d chars, keep the headings Game / Conventions / Decisions / Known issues) and give a ≤ %d-char summary of this plan. Call write_memory once."):format(facts, oldNotes ~= "" and oldNotes or "(none)", HttpService:JSONEncode(record), NOTES_MAX, SUMMARY_MAX) } } }
+			local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = ("=== MEMORY: FACTS ===\n%s\n\n=== MEMORY: NOTES (current) ===\n%s\n\n=== RECORD ===\n%s\n\n=== PHASE ===\nRewrite Notes (≤ %d chars, keep the headings Game / Conventions / Decisions / Known issues) and give a ≤ %d-char summary of this plan. Call write_memory once."):format(facts, oldNotes ~= "" and oldNotes or "(none)", HttpService:JSONEncode(record), CFG.NOTES_MAX, CFG.SUMMARY_MAX) } } }
 			local ps = newPhaseState("RECORDING", 1)
 			ps.budget.calls = 1
 			runPhaseLoop(convo, ps, Schemas.forPhase("RECORDING"), "write_memory", function(args)
-				newNotes = utf8Trim(tostring(args.notes or oldNotes), NOTES_MAX)
-				summary = utf8Trim(tostring(args.plan_summary or summary), SUMMARY_MAX)
+				newNotes = utf8Trim(tostring(args.notes or oldNotes), CFG.NOTES_MAX)
+				summary = utf8Trim(tostring(args.plan_summary or summary), CFG.SUMMARY_MAX)
 				return true
 			end)
 			Goal.estTokens += ps.used.tokens
@@ -3764,9 +3836,9 @@ function Agent.plan(goalText)
 	GoalUI.setBusy(true)
 	local instruction
 	if #Goal.goalText > 0 then
-		instruction = ("GOAL: %s\nFocus areas: %s\nInvestigate with the read tools until you can write a plan of at most %d steps. Each step must name its targets by path or #ref; selected instances and the active script are the likely targets when the goal says 'this'. Prefer replace_lines or edit_script over rewrites. Mark risk honestly. Then call submit_plan."):format(Goal.goalText, focusText(), MAX_STEPS)
+		instruction = ("GOAL: %s\nFocus areas: %s\nInvestigate with the read tools until you can write a plan of at most %d steps. Each step must name its targets by path or #ref; selected instances and the active script are the likely targets when the goal says 'this'. Prefer replace_lines or edit_script over rewrites. Mark risk honestly. Then call submit_plan."):format(Goal.goalText, focusText(), CFG.MAX_STEPS)
 	else
-		instruction = ("PLAN NEXT: propose the most valuable improvements along these focus areas: %s. Read what you need, then call submit_plan with at most %d steps."):format(focusText(), MAX_STEPS)
+		instruction = ("PLAN NEXT: propose the most valuable improvements along these focus areas: %s. Read what you need, then call submit_plan with at most %d steps."):format(focusText(), CFG.MAX_STEPS)
 	end
 	local convo = { messages = { { role = "system", content = SYS_GOAL }, { role = "user", content = buildGoalUserBlock(instruction) } } }
 	Goal.planConvo = convo
@@ -3878,7 +3950,7 @@ local function stepSeed(step)
 	table.insert(parts, "=== MEMORY: NOTES ===\n" .. (notes ~= "" and notes or "(none)"))
 	table.insert(parts, "=== APPROVED PLAN ===\n" .. HttpService:JSONEncode(Goal.plan))
 	table.insert(parts, ("=== STEP ===\nYou are executing step %d: %s\n%s\nTargets: %s"):format(step.n, step.title, step.detail, table.concat(step.targets, ", ")))
-	local budget = STEP_SEED_MAX
+	local budget = CFG.STEP_SEED_MAX
 	for _, t in ipairs(step.targets) do
 		local inst = Tools.resolve(t)
 		if inst then
@@ -4038,7 +4110,7 @@ local function captureFromHistoryTable(hist, boundaryTs)
 		if (e.timestamp or 0) < boundaryTs - 1 then sawOlder = true; break end
 		local msg = tostring(e.message)
 		if e.messageType == Enum.MessageType.MessageError then
-			if chars + #msg <= OUTPUT_MAX_CHARS then table.insert(errors, 1, msg); chars += #msg end
+			if chars + #msg <= CFG.OUTPUT_MAX_CHARS then table.insert(errors, 1, msg); chars += #msg end
 		elseif e.messageType == Enum.MessageType.MessageWarning then
 			warnings += 1
 		elseif #output < 60 then
@@ -4213,7 +4285,7 @@ SelfTest.case("agent: estimate and compaction", function()
 	assert(before > 30000, "big convo estimate " .. before)
 	assert(compactConvo(convo) == true, "compacted")
 	assert(convo.messages[4].content:find("elided", 1, true), "oldest tool result elided first")
-	assert(estimateTokens(convo.messages, {}, nil) <= BIG_REQ_MAX, "under cap after compaction")
+	assert(estimateTokens(convo.messages, {}, nil) <= CFG.BIG_REQ_MAX, "under cap after compaction")
 	assert(estimateTokens({ { role = "user", content = "x" } }, {}, { prompt_tokens = 1000, completion_tokens = 50 }) >= 1050, "usage-based estimate")
 end)
 SelfTest.case("agent: batch budget rule", function()
@@ -4228,7 +4300,7 @@ SelfTest.case("agent: batch budget rule", function()
 end)
 SelfTest.case("agent: validatePlan enforces limits", function()
 	local steps = {}
-	for i = 1, MAX_STEPS + 1 do steps[i] = { title = "s" .. i, action = "edit", targets = { "Workspace.X" }, detail = "d", risk = "low" } end
+	for i = 1, CFG.MAX_STEPS + 1 do steps[i] = { title = "s" .. i, action = "edit", targets = { "Workspace.X" }, detail = "d", risk = "low" } end
 	local _, err = validatePlan({ title = "t", summary = "s", verify_hint = "v", steps = steps })
 	assert(err and err:find("10", 1, true), "too many steps rejected: " .. tostring(err))
 	local plan = assert(validatePlan({ title = string.rep("t", 200), summary = "s", verify_hint = "v", steps = { steps[1] } }))
@@ -4251,7 +4323,7 @@ SelfTest.case("agent: stepSeed pre-injects sources with head/tail cap", function
 		local seed = stepSeed(step)
 		assert(seed:find("You are executing step 1", 1, true), "instruction present")
 		assert(seed:find("page with read_script", 1, true), "cap note present")
-		assert(#seed < STEP_SEED_MAX + 6000, "seed bounded, got " .. #seed)
+		assert(#seed < CFG.STEP_SEED_MAX + 6000, "seed bounded, got " .. #seed)
 		assert(seed:find('"n":1', 1, true) or seed:find("step 1", 1, true), "plan json present")
 		Goal.plan = nil
 	end)
@@ -4264,9 +4336,14 @@ SelfTest.case("agent: afterActing routes by step statuses", function()
 	assert(Agent.allIncludedDone() == false, "failed blocks verify")
 	Goal.plan, Goal.steps = nil, {}
 end)
+SelfTest.case("config: Memory sub-caps fit the combined budget", function()
+	assert(CFG.FACTS_MAX + CFG.NOTES_MAX <= CFG.MEMORY_MAX,
+		("facts %d + notes %d exceeds the %d Memory budget")
+			:format(CFG.FACTS_MAX, CFG.NOTES_MAX, CFG.MEMORY_MAX))
+end)
 SelfTest.case("record: buildFacts is bounded and lists services", function()
 	local f = buildFacts()
-	assert(#f <= FACTS_MAX, "facts within cap: " .. #f)
+	assert(#f <= CFG.FACTS_MAX, "facts within cap: " .. #f)
 	assert(f:find("Workspace", 1, true) and f:find("ServerScriptService", 1, true), "services listed")
 end)
 SelfTest.case("record: status derivation", function()
@@ -4635,7 +4712,7 @@ local function historyChars()
 end
 
 local function trimHistory()
-	while #history > HISTORY_MAX_MSGS or (historyChars() > HISTORY_MAX_CHARS and #history > 1) do
+	while #history > CFG.HISTORY_MAX_MSGS or (historyChars() > CFG.HISTORY_MAX_CHARS and #history > 1) do
 		table.remove(history, 1)
 	end
 end
